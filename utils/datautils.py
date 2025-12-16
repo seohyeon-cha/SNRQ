@@ -101,7 +101,11 @@ def get_c4(nsamples, seed, seqlen, model, hf_token=None, eval_mode=False):
                 trainenc = tokenizer(traindata[i]['text'], return_tensors='pt')
                 if trainenc.input_ids.shape[1] >= seqlen:
                     break
-            i = random.randint(0, trainenc.input_ids.shape[1] - seqlen - 1)
+            max_start_idx = trainenc.input_ids.shape[1] - seqlen
+            if max_start_idx > 0:
+                i = random.randint(0, max_start_idx)
+            else:
+                i = 0
             j = i + seqlen
             inp = trainenc.input_ids[:, i:j]
             tar = inp.clone()

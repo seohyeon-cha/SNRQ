@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 0:30:00     
+#SBATCH -t 1:00:00     
 #SBATCH --output=slurm_out/gptq_%j.out
 #SBATCH --error=slurm_out/gptq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -45,8 +45,8 @@ MODEL_PATH="meta-llama/Llama-2-13b-hf"
 ALPHA=0.25
 BETA=0.0003
 
-WBITS_VALUES=(4)
-SEEDS=(2)
+WBITS_VALUES=(3)
+SEEDS=(3 4)
 
 DATE=$(date +"%Y%m%d")
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
@@ -68,13 +68,13 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --true-sequential \
       --sym \
       --act-order \
-      --groupsize 128 \
+      --groupsize -1 \
       --seed $seed \
       --eval \
       --lm-eval \
       --wandb \
       --wandb-project L2-13B-symm-new \
-      --wandb-name gptq_${wbits}bit_seed${seed}"
+      --wandb-name gptq_perchannel_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

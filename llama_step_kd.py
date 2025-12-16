@@ -5,12 +5,14 @@ import torch
 import torch.nn as nn
 import quant
 import os
+import logging
 
 from transformers import LlamaConfig, LlamaForCausalLM, modeling_utils
 from algorithms.gptq import GPTQ
 from algorithms.gptaq import GPTAQ
 from algorithms.greedyaq import GreedyAQ
 from algorithms.foem import FOEM
+from algorithms.guidedquant import GuidedQuant
 from algorithms.gptq import Observer  # Observer is the same across all algorithms
 from utils import find_layers, DEV, get_loaders, export_quant_table, gen_conditions
 from texttable import Texttable
@@ -18,6 +20,7 @@ import copy
 import transformers
 import utils
 from utils import gradient_utils
+
 
 def get_llama(model):
 
@@ -120,7 +123,29 @@ def llama_sequential(model,
         and getattr(args, "kd_beta", 0.0) != 0.0
     )
 
+    if args.method == "guidedq":
+        model_name = args.model.split('/')[-1]
+        grd_path = (f"cache_for_guidedq/gradients/"
+                            f"{model_name}-{args.dataset}_s{args.nsamples}_blk{model.seqlen}_g{args.guided_num_groups}")
+        saliency_path = (f"cache_for_guidedq/saliency/"
+                            f"{model_name}-{args.dataset}_s{args.nsamples}_blk{model.seqlen}_g{args.guided_num_groups}")
+                
+        with torch.enable_grad():
+            model_gradients = gradient_utils.get_saliency_gradients(
+                model,
+                dataloader,
+                num_groups=args.guided_num_groups,
+                num_batches=args.nsamples,
+                grd_path=grd_path,
+                saliency_path=saliency_path,
+                dev=dev, args=args
+            )
+
     for i in range(len(layers)):
+        if args.method == "guidedq":
+            saliency_dict = torch.load(os.path.join(saliency_path, f"l{i}.pt"))
+            print("Loaded saliency for layer", i)
+
         layer = layers[i].to(dev)
         full = find_layers(layer)
 
@@ -156,6 +181,8 @@ def llama_sequential(model,
                     gptq[name] = FOEM(subset_student[name], observe=args.observe)
                 elif args.method == "gptq":
                     gptq[name] = GPTQ(subset_student[name], observe=args.observe)
+                elif args.method == "guidedq":
+                    gptq[name] = GuidedQuant(subset_student[name], saliency=saliency_dict[name], guided_num_groups=args.guided_num_groups)
                 else:
                     raise ValueError(f"Method {args.method} not supported.")
 
@@ -215,6 +242,14 @@ def llama_sequential(model,
                         gradient=None,   # <-- no KD yet
                         args=args
                     )
+                elif args.method == "guidedq":
+                    scale, zero, g_idx, error = gptq[name].fasterquant(
+                        percdamp=args.percdamp,
+                        groupsize=args.groupsize,
+                        actorder=args.act_order,
+                        name=name,
+                        args=args
+                )
                 else:
                     scale, zero, g_idx, error = gptq[name].fasterquant(
                         percdamp=args.percdamp,
@@ -226,11 +261,12 @@ def llama_sequential(model,
                         args=args
                     )
 
-                quantizers[f'model.layers.{i}.{name}'] = (
-                    gptq[name].quantizer.cpu(),
-                    scale.cpu(), zero.cpu(), g_idx.cpu(),
-                    args.wbits, args.groupsize
-                )
+                if args.method != "guidedq":
+                    quantizers[f'model.layers.{i}.{name}'] = (
+                        gptq[name].quantizer.cpu(),
+                        scale.cpu(), zero.cpu(), g_idx.cpu(),
+                        args.wbits, args.groupsize
+                    )
 
                 if args.observe:
                     observer.submit(name=name, layerid=i, gptq=gptq[name], error=error)
@@ -245,17 +281,17 @@ def llama_sequential(model,
 
         
         # ---- KD-based SECOND PASS on this layer ----
-        if use_layerwise_kd and i >= len(layers)-args.n_layers_to_update:
+        if args.method == "greedyaq" and use_layerwise_kd and i >= len(layers)-args.n_layers_to_update:
             # Compute KD gradients for current partially quantized model
             with torch.enable_grad():
                 kd_gradients, _ = gradient_utils.get_kd_gradients(
                     teacher_model,
-                    teacher_model,
+                    model,
                     dataloader,
                     num_batches=args.nsamples,
                     T=kd_T,
                     save_path=None,
-                    dev=dev,
+                    dev=dev, args=args
                 )
  
             # Re-quantize modules in layer i with KD gradients
@@ -290,8 +326,20 @@ def llama_sequential(model,
 
                     if args.observe:
                         observer.submit(name=name, layerid=i, gptq=qobj, error=error)
-                    else:
+
+                    
+                    if not args.observe:
                         qobj.free()
+            
+            # After KD second pass, ensure layer is back on dev for forward pass
+            # get_kd_gradients moves the entire model to CPU, so we need to move layer back
+            layer = layer.to(dev)
+            # Also ensure inps, attention_mask, and position_ids are on the correct device
+            inps = inps.to(dev)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(dev)
+            if position_ids is not None:
+                position_ids = position_ids.to(dev)
 
         print('+------------------+--------------+------------+-----------+-------+')
         print('\n')
@@ -632,6 +680,7 @@ if __name__ == '__main__':
     parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
     parser.add_argument('--step', action='store_true', help='')
     parser.add_argument('--step_bits', type=int, default=8)
+    parser.add_argument('--reverse-kd', action='store_true', help='Whether to reverse the KD direction.')
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
     parser.add_argument('--beta', type=float, default=0.0003, help='Coefficient for weight correction term')
@@ -649,8 +698,12 @@ if __name__ == '__main__':
     parser.add_argument('--first-quant-checkpoint', type=str, default='', help='Path to save/load first quantization checkpoint')
     parser.add_argument('--layers-to-update', type=str, default='sensitive', help='Comma-separated list of layer indices to update in second quantization (e.g., "0,1,2" or "all" or "sensitive" for sensitivity-based selection)')
     parser.add_argument('--sensitivity-threshold', type=float, default=None, help='Sensitivity threshold for selecting layers to update (only used if --layers-to-update=sensitive)')
+    # For GuidedQ
+    parser.add_argument('--guided-num-groups', type=int, default=4, help='Number of groups to use for guided quantization.')
+    # Plotting removed for KD code
 
     args = parser.parse_args()
+
 
     # Initialize wandb if enabled
     if args.wandb:
@@ -675,6 +728,8 @@ if __name__ == '__main__':
                 'n_layers_to_update': args.n_layers_to_update,
                 'kd_T': args.kd_T,
                 'kd_beta': args.kd_beta,
+                'reverse_kd': args.reverse_kd, 
+                'guided_num_groups': args.guided_num_groups,
             }
         )
 

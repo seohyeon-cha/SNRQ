@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
+#SBATCH -t 0:30:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -46,13 +46,13 @@ MODEL_PATH="meta-llama/Llama-2-7b-hf"
 
 ALPHA=0.2
 BETA=0.0003
-BETA_KD=1e-5
-N_LAYERS_TO_UPDATE=10
+BETA_KD=1e-3
+N_LAYERS_TO_UPDATE=30
 
-WBITS_VALUES=(2)
-SEEDS=(0 1 2)
+WBITS_VALUES=(3)
+SEEDS=(2)
 
-DATE=$(date +"%Y%m%d")
+DATE=$(date +"%Y%m% d")
 mkdir -p logs/l2-7b
 mkdir -p slurm_out
 
@@ -75,14 +75,12 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --alpha ${ALPHA} \
       --n_layers_to_update ${N_LAYERS_TO_UPDATE} \
       --kd-beta ${BETA_KD} \
-      --incoh-process \
-      --incoh-mode had \
+      --nsamples 128 \
       --eval \
       --lm-eval \
-      --kd-T 1.0 \
-      --wandb \
-      --wandb-project L2-7B-symm-2bits \
-      --wandb-name greedyaq_kd_10_${wbits}bit_seed${seed}"
+      --kd-T 2.0 \
+      --wandb-project L2-7B-KD-test \
+      --wandb-name greedyaq_forwardkd_${N_LAYERS_TO_UPDATE}layers_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

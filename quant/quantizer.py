@@ -114,9 +114,15 @@ class Quantizer(nn.Module):
             self.scale = self.scale.unsqueeze(0)
             self.zero = self.zero.unsqueeze(0)
 
-    def quantize(self, x):
+    def quantize(self, x, st_idx=None, end_idx=None):
         if self.ready():
-            return self._quantize(x, self.scale, self.zero, self.maxq)
+            if st_idx is not None and end_idx is not None:
+                scale = self.scale[st_idx:end_idx]
+                zero = self.zero[st_idx:end_idx]
+            else:
+                scale = self.scale
+                zero = self.zero
+            return self._quantize(x, scale, zero, self.maxq)
 
         return x
 

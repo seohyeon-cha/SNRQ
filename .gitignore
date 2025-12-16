@@ -52,3 +52,7 @@ slurm_out/
 saved_gradients/
 saved_quant/
 wandb/
+plots/
+logs/
+logs6/
+cache_for_guidedq/

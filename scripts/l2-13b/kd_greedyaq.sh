@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 1:30:00     
+#SBATCH -t 3:00:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -46,7 +46,7 @@ MODEL_PATH="meta-llama/Llama-2-13b-hf"
 
 ALPHA=0.2
 BETA=0.0003
-BETA_KD=1e-4
+BETA_KD=1e-3
 N_LAYERS_TO_UPDATE=5
 
 WBITS_VALUES=(3)
@@ -75,13 +75,12 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --alpha ${ALPHA} \
       --n_layers_to_update ${N_LAYERS_TO_UPDATE} \
       --kd-beta ${BETA_KD} \
-      --incoh-process \
-      --incoh-mode had \
       --eval \
       --lm-eval \
-      --kd-T 0.5 \
-      --wandb-project L2-13B-symm-kron-KD \
-      --wandb-name greedyaq_kd_full_${wbits}bit_seed${seed}"
+      --kd-T 2.0 \
+      --wandb \
+      --wandb-project L2-13B-KD-test \
+      --wandb-name greedyaq_forwardkd_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

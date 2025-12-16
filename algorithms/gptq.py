@@ -123,7 +123,7 @@ class GPTQ:
         table.add_row([name, weight_error, fp_SNR, q_SNR, timecost])
         print(table.draw().split('\n')[-2])
 
-    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name='', fp_weight=None, alpha=None, beta=None):
+    def fasterquant(self, blocksize=128, percdamp=.01, groupsize=-1, actorder=False, name='', fp_weight=None, alpha=None, beta=None, args=None):
         self.layer.to(self.dev)
 
 
@@ -149,7 +149,8 @@ class GPTQ:
         if actorder:
             perm = torch.argsort(torch.diag(H), descending=True)
             W = W[:, perm]
-            H = H[perm][:, perm]
+            H = H[perm]
+            H = H[:, perm]
 
         Losses = torch.zeros_like(W)
         Q = torch.zeros_like(W)
@@ -228,9 +229,9 @@ class GPTQ:
             self.layer.weight.data.dtype
         )
 
-
         self.print_loss(name=name, q_weight=Q, weight_error=error, timecost=(time.time() - tick))
-
+        del W, Q, H, Hinv, Losses
+        
         if scale == []:
             scale.append(self.quantizer.scale)
             zero.append(self.quantizer.zero)

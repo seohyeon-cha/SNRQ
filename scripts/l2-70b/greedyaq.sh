@@ -3,9 +3,9 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:30:00     
-#SBATCH --output=slurm_out/l3-7b-test-greedyaq_%j.out
-#SBATCH --error=slurm_out/l3-7b-test-greedyaq_%j.err
+#SBATCH -t 2:00:00     
+#SBATCH --output=slurm_out/greedyaq_%j.out
+#SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=seohyeon.cha@utexas.edu
 
@@ -42,22 +42,19 @@ PY
 
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 
-BASE_PLOT_PATH="plots/alpha/l2-13b/3bits_g128"
+BASE_PLOT_PATH="plots/alpha/l2-70b"
 mkdir -p "${BASE_PLOT_PATH}"
 
-
-MODEL_PATH="meta-llama/Llama-2-13b-hf"
-
-ALPHA=0.5
+MODEL_PATH="meta-llama/Llama-2-70b-hf"
+ALPHA=0.0
+ALPHA_METHOD="fixed"
+MIXUP=5
 BETA=0.0003
-ALPHA_METHOD="sample"
-MIXUP=5.0
 WBITS_VALUES=(3)
-SEEDS=(0 1 2 3 4)
+SEEDS=(0)
 
-DATE=$(date +"%Y%m%d")
-mkdir -p logs/l2-13b
-mkdir -p slurm_out
+DATE=$(date +"%Y%m%d") 
+
 
 for wbits in "${WBITS_VALUES[@]}"; do
   echo "===== Testing bitwidth wbits = $wbits ====="
@@ -65,27 +62,27 @@ for wbits in "${WBITS_VALUES[@]}"; do
   for seed in "${SEEDS[@]}"; do
     echo "--- Running seed = $seed ---"
     
-    LOG_FILE="/work/10322/scha0901/vista/FOEM/LLM/weight-only/logs/l2-13b/${DATE}_l2-13b-${wbits}bit-128g_greedyaq_seed${seed}.log"
+    LOG_FILE="logs/l2-70b/${DATE}_l2-70b-${wbits}bit-128g_greedyaq_seed${seed}.log"
     
-    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u /work/10322/scha0901/vista/FOEM/LLM/weight-only/llama_step.py \
+    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u llama_step.py \
       $MODEL_PATH c4 \
       --method greedyaq \
-      --wbits $wbits \
       --sym \
+      --wbits $wbits \
       --true-sequential \
       --groupsize 128 \
       --seed $seed \
       --alpha-method ${ALPHA_METHOD} \
       --alpha ${ALPHA} \
-      --mixup-param ${MIXUP} \
+      --nsamples 128 \
       --eval \
       --lm-eval \
-      --incoh-process \
-      --incoh-mode had \
+      --lm-eval-batch-size 4 \
+      --mixup-param ${MIXUP} \
       --plot-delta-x-path "${BASE_PLOT_PATH}" \
       --wandb \
-      --wandb-project Sample-Alpha-Incoh \
-      --wandb-name L2-13B_module_${wbits}bit_seed${seed}"
+      --wandb-project L2-70B-symm-new \
+      --wandb-name greedyaq_0.25ref_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

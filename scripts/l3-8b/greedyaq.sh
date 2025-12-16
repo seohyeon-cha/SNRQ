@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 1:30:00     
+#SBATCH -t 2:00:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -42,13 +42,17 @@ PY
 
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 
+BASE_PLOT_PATH="plots/alpha/l3-8b/3bits_g128_sample"
+mkdir -p "${BASE_PLOT_PATH}"
+
 MODEL_PATH="meta-llama/Meta-Llama-3-8B"
 
-ALPHA=0.25
+ALPHA=0.5
 BETA=0.0003
 ALPHA_METHOD="fixed"
-WBITS_VALUES=(4)
-SEEDS=(0 1 2)
+MIXUP=5.0
+WBITS_VALUES=(3)
+SEEDS=(1 2 3 4)
 
 DATE=$(date +"%Y%m%d")
 mkdir -p logs/l3-8b
@@ -70,15 +74,17 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --true-sequential \
       --groupsize 128 \
       --seed $seed \
-      --alpha ${ALPHA} \
       --alpha-method ${ALPHA_METHOD} \
+      --alpha ${ALPHA} \
+      --mixup-param ${MIXUP} \
       --incoh-process \
       --incoh-mode had \
       --eval \
       --lm-eval \
+      --plot-delta-x-path "${BASE_PLOT_PATH}" \
       --wandb \
-      --wandb-project L3-8B-symm-incoh \
-      --wandb-name greedyaq_ref_ratio_${wbits}bit_seed${seed}"
+      --wandb-project Optimize-Alpha-Incoh \
+      --wandb-name L3-8B_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"
