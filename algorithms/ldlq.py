@@ -165,12 +165,10 @@ class LDLQ:
         damp = args.percdamp * torch.mean(torch.diag(Hr))
         diag = torch.arange(Hr.shape[0], device=Hr.device)
         Hr[diag, diag] += damp
-
         
         if not self.quantizer.ready():
             self.quantizer.find_params(Wr, weight=True)
 
-    
         p = torch.argsort(torch.diag(Hr), descending=False) # sort based on column of X_t 
         P = torch.eye(Hr.shape[0], device=Hr.device)[:, p]
         Hp = Hr[p][:, p]

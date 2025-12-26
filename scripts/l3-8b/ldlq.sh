@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -J gptaq        # Job name
+#SBATCH -J ldlq        # Job name
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
-#SBATCH --output=slurm_out/gptaq_%j.out
-#SBATCH --error=slurm_out/gptaq_%j.err
+#SBATCH -t 1:40:00     
+#SBATCH --output=slurm_out/ldlq_%j.out
+#SBATCH --error=slurm_out/ldlq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=seohyeon.cha@utexas.edu
 
@@ -40,18 +40,14 @@ print("CUDA available:", torch.cuda.is_available())
 print("exe:", sys.executable)
 PY
 
-MODEL_PATH="meta-llama/Llama-2-70b-hf"
-
-ALPHA=0.25
-BETA=0.0003
-
-WBITS_VALUES=(3)
-SEEDS=(0)
-
-DATE=$(date +"%Y%m%d")
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
-mkdir -p logs/l2-70b
-mkdir -p slurm_out
+
+MODEL_PATH="meta-llama/Meta-Llama-3-8B"
+BETA=0.0003
+WBITS_VALUES=(3)
+SEEDS=(0 1 2 3 4)
+
+DATE=$(date +"%Y%m%d") 
 
 
 for wbits in "${WBITS_VALUES[@]}"; do
@@ -60,24 +56,22 @@ for wbits in "${WBITS_VALUES[@]}"; do
   for seed in "${SEEDS[@]}"; do
     echo "--- Running seed = $seed ---"
     
-    LOG_FILE="/work/10322/scha0901/vista/FOEM/LLM/weight-only/logs/l2-70b/${DATE}_l2-70b-${wbits}bit-128g_gptaq_seed${seed}.log"
+    LOG_FILE="logs/l3-8b/${DATE}_l3-8b-${wbits}bit-128g_ldlq_seed${seed}.log"
     
-    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u /work/10322/scha0901/vista/FOEM/LLM/weight-only/llama_step.py \
+    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u llama_step.py \
       $MODEL_PATH c4 \
-      --method gptaq \
+      --method ldlq \
+      --sym \
       --wbits $wbits \
       --true-sequential \
-      --sym \
-      --act-order \
       --groupsize 128 \
       --seed $seed \
-      --alpha ${ALPHA} \
+      --nsamples 128 \
       --eval \
       --lm-eval \
-      --lm-eval-batch-size 1 \
       --wandb \
-      --wandb-project L2-70B-symm-new \
-      --wandb-name gptaq_${wbits}bit_seed${seed}"
+      --wandb-project L3-8B-symm-new \
+      --wandb-name ldlq_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"
@@ -96,3 +90,4 @@ for wbits in "${WBITS_VALUES[@]}"; do
 done
 
 echo "All tests completed!"
+

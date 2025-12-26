@@ -188,7 +188,7 @@ def llama_sequential(model, dataloader, dev, fp_path):
             for name in subset:
                 # GreedyAQ requires args parameter, others don't need it
                 if args.method == "greedyaq":
-                    if args.alpha_method == "fixed":
+                    if args.alpha_method == "optimize":
                         if i == 0:
                             args.alpha_per_module[name] = [0.0]
                         if i == 1:
@@ -609,6 +609,7 @@ def llama_pack(model, quantizers, wbits, groupsize):
 
 
 def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True, warmup_autotune=True):
+    from transformers import LlamaConfig, LlamaForCausalLM
     config = LlamaConfig.from_pretrained(model)
 
     def noop(*args, **kwargs):
@@ -618,11 +619,11 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True
     torch.nn.init.uniform_ = noop
     torch.nn.init.normal_ = noop
 
-    torch.set_default_dtype(torch.bfloat16)
-    modeling_utils._init_weights = False
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(torch.half)
+    transformers.modeling_utils._init_weights = False
+    torch.set_default_dtype(torch.half)
     model = LlamaForCausalLM(config)
-    torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_dtype(torch.float)
     if eval:
         model = model.eval()
     layers = find_layers(model)
@@ -636,25 +637,23 @@ def load_quant(model, checkpoint, wbits, groupsize=-1, fused_mlp=True, eval=True
     print('Loading model ...')
     if checkpoint.endswith('.safetensors'):
         from safetensors.torch import load_file as safe_load
-        model.load_state_dict(safe_load(checkpoint))
+        model.load_state_dict(safe_load(checkpoint), strict=False)
     else:
-        model.load_state_dict(torch.load(checkpoint))
+        model.load_state_dict(torch.load(checkpoint), strict=False)
 
-    # if eval:
-    #     quant.make_quant_attn(model)
-    #     quant.make_quant_norm(model)
-    #     if fused_mlp:
-    #         quant.make_fused_mlp(model)
-
-    # if warmup_autotune:
-    #     quant.autotune_warmup_linear(model, transpose=not (eval))
-    #     if eval and fused_mlp:
-    #         quant.autotune_warmup_fused(model)
+    if eval:
+        quant.make_quant_attn(model)
+        quant.make_quant_norm(model)
+        if fused_mlp:
+            quant.make_fused_mlp(model)
+    if warmup_autotune:
+        quant.autotune_warmup_linear(model, transpose=not (eval))
+        if eval and fused_mlp:
+            quant.autotune_warmup_fused(model)
     model.seqlen = 2048
     print('Done.')
 
     return model
-
 
 def llama_multigpu(model, gpus, gpu_dist):
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
@@ -810,9 +809,17 @@ if __name__ == '__main__':
     parser.add_argument('--step_bits', type=int, default=8)
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--sort-asym', action='store_true', help='Whether to sort asymmetric quantization levels.')
-    parser.add_argument('--alpha-method', type=str, default='fixed', choices=['fixed', 'alternate', 'sample'], help='Method to use for alpha update.')
+    parser.add_argument('--alpha-method', type=str, default='fixed', choices=['optimize', 'fixed', 'alternate', 'sample'], help='Method to use for alpha update.')
     parser.add_argument('--mixup-param', type=float, default=0.0, help='Mixup parameter for GreedyAQ.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
+    parser.add_argument('--cd_passes', type=int, default=0, help='Number of coordinate descent passes for GreedyAQ.')
+    # for beam search
+    parser.add_argument('--beam-size', type=int, default=1, help='Coefficient for weight correction term')
+    parser.add_argument('--beam-cands', type=int, default=3, help='Coefficient for weight correction term')
+    parser.add_argument('--beam-sigma', type=float, default=0.25, help='Coefficient for weight correction term')
+    parser.add_argument('--beam-k', type=int, default=16, help='Coefficient for weight correction term')
+    parser.add_argument('--nn_beam', action='store_true', help='Whether to plot delta X values and generate 3D plots of |X_q - X_f|')
+
     parser.add_argument('--beta', type=float, default=0.0003, help='Coefficient for weight correction term')
     parser.add_argument('--incoh-process', action='store_true', help='Whether to perform incoherence process.')
     parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
@@ -852,7 +859,12 @@ if __name__ == '__main__':
                 'incoh_process': args.incoh_process,
                 'incoh_mode': args.incoh_mode,
                 'rescale_D': args.rescale_D,
-                'mixup_param': args.mixup_param
+                'mixup_param': args.mixup_param,
+                'beam_size': args.beam_size,
+                'beam_cands': args.beam_cands, 
+                'nn_beam': args.nn_beam,
+                'cd_passes': args.cd_passes,
+
             }
         )
 
@@ -875,7 +887,6 @@ if __name__ == '__main__':
             model_high.eval()
             for name, param in model.named_parameters():
                 print(name)
-                import pdb; pdb.set_trace()
                 param.data = model_high.get_buffer('.'.join(name.split('.')[:-1]+['qweight']))
 
     dataloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen)
@@ -884,8 +895,10 @@ if __name__ == '__main__':
     if (not args.load and args.wbits < 16 and not args.nearest) or args.step:
         # Default to gptq if method not specified
 
+        torch.cuda.synchronize()
         tick = time.time()
         quantizers = llama_sequential(model, dataloader, DEV, args.model)
+        torch.cuda.synchronize()
         quant_time = time.time() - tick
         print(f"Quantization time: {quant_time}s")
         if args.wandb:
@@ -1069,6 +1082,32 @@ if __name__ == '__main__':
             else:
                 print('No valid MAE data found in pickle files')
 
+    if args.test_generation:
+        gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
+        if len(gpus) > 1:
+            llama_multigpu(model, gpus, gpu_dist)
+        else:
+            model = model.to(DEV)
+
+        from transformers import LlamaTokenizer, TextStreamer
+        tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
+        input_ids = tokenizer(["The capital of New Mexico is"], return_tensors="pt").input_ids.to(gpus[0])
+        streamer = TextStreamer(tokenizer)
+        with torch.no_grad():
+            generated_ids = model.generate(input_ids, streamer=streamer)
+        
+
+    if args.quant_directory is not None:
+        export_quant_table(quantizers, args.quant_directory)
+
+    if not args.observe and args.save:
+        # import pdb; pdb.set_trace()
+        model.save_pretrained(f'ckpts/{args.save}')
+        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=getattr(args, 'hf_token', None))
+        tokenizer.save_pretrained(f'ckpts/{args.save}')
+        # llama_6(model, quantizers, args.wbits, args.groupsize)
+        # torch.save(model.state_dict(), args.save)
+
     if args.lm_eval:
         import lm_eval
         from lm_eval.models.huggingface import HFLM
@@ -1120,32 +1159,8 @@ if __name__ == '__main__':
             wandb.log({"lm_eval_results_table": table})
 
 
-    if args.test_generation:
-        gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
-        if len(gpus) > 1:
-            llama_multigpu(model, gpus, gpu_dist)
-        else:
-            model = model.to(DEV)
-
-        from transformers import LlamaTokenizer, TextStreamer
-        tokenizer = LlamaTokenizer.from_pretrained(args.model, use_fast=False)
-        input_ids = tokenizer(["The capital of New Mexico is"], return_tensors="pt").input_ids.to(gpus[0])
-        streamer = TextStreamer(tokenizer)
-        with torch.no_grad():
-            generated_ids = model.generate(input_ids, streamer=streamer)
-        
-
-
-    if args.quant_directory is not None:
-        export_quant_table(quantizers, args.quant_directory)
-
-    if not args.observe and args.save:
-        # import pdb; pdb.set_trace()
-        model.save_pretrained(f'ckpts/{args.save}')
-        tokenizer = transformers.AutoTokenizer.from_pretrained(args.model, use_fast=False, use_auth_token=getattr(args, 'hf_token', None))
-        tokenizer.save_pretrained(f'ckpts/{args.save}')
-        # llama_6(model, quantizers, args.wbits, args.groupsize)
-        # torch.save(model.state_dict(), args.save)
+    if args.wandb:
+        wandb.finish()
 
     if not args.observe and args.save_safetensors:
         llama_pack(model, quantizers, args.wbits, args.groupsize)
@@ -1153,6 +1168,4 @@ if __name__ == '__main__':
         state_dict = model.state_dict()
         state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
         safe_save(state_dict, args.save_safetensors)
-
-    if args.wandb:
-        wandb.finish()
+        

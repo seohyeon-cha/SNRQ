@@ -40,7 +40,7 @@ def rotate_half_kernel(
     position_id = tl.load(position_ids_ptr + batch * position_ids_batch_stride + seq)
     # As sometimes happens, just calculating this on the fly is faster than loading it from memory.
     # Use `tl.libdevice.exp` rather than `tl.exp` -- the latter is less accurate.
-    freq = tl.libdevice.exp((col + tl.arange(0, BLOCK_WIDTH)).to(tl.float32) * INV_BASE) * position_id
+    freq = tl.math.exp((col + tl.arange(0, BLOCK_WIDTH)).to(tl.float32) * INV_BASE) * position_id
     cos = tl.cos(freq).to(tl.float32)
     sin = tl.sin(freq).to(tl.float32)
 
@@ -114,7 +114,7 @@ class QuantLlamaAttention(nn.Module):
         self.qkv_proj = qkv_proj
         self.o_proj = o_proj
 
-    def forward(self, hidden_states, past_key_value=None, attention_mask=None, position_ids=None, output_attentions=False, use_cache=False):
+    def forward(self, hidden_states, past_key_value=None, attention_mask=None, position_ids=None, output_attentions=False, use_cache=False, cache_position=None):
         """Input shape: Batch x Time x Channel"""
 
         bsz, q_len, _ = hidden_states.size()

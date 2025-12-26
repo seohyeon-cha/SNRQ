@@ -45,7 +45,7 @@ MODEL_PATH="meta-llama/Llama-2-7b-hf"
 ALPHA=0.25
 BETA=0.0003
 
-WBITS_VALUES=(3)
+WBITS_VALUES=(4)
 SEEDS=(3 4)
 
 DATE=$(date +"%Y%m%d")
@@ -68,7 +68,7 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --true-sequential \
       --sym \
       --act-order \
-      --groupsize -1 \
+      --groupsize 128 \
       --seed $seed \
       --eval \
       --lm-eval \

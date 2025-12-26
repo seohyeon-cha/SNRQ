@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 5:00:00     
+#SBATCH -t 6:30:00     
 #SBATCH --output=slurm_out/gptq_%j.out
 #SBATCH --error=slurm_out/gptq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -66,6 +66,7 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --method guidedq \
       --wbits $wbits \
       --true-sequential \
+      --lm-eval-batch-size 4 \
       --sym \
       --act-order \
       --percdamp 0.01 \

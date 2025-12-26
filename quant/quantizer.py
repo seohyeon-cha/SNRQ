@@ -31,6 +31,7 @@ class Quantizer(nn.Module):
         q = torch.clamp(torch.round(x / scale) + zero, 0, maxq)
         return scale * (q - zero)
 
+
     def find_params(self, x, weight=False):
         dev = x.device
         self.maxq = self.maxq.to(dev)
@@ -91,6 +92,7 @@ class Quantizer(nn.Module):
                     best[tmp] = err[tmp]
                     self.scale[tmp] = scale1[tmp]
                     self.zero[tmp] = zero1[tmp]
+        
         if not self.perchannel:
             if weight:
                 tmp = shape[0]
@@ -115,14 +117,14 @@ class Quantizer(nn.Module):
             self.zero = self.zero.unsqueeze(0)
 
     def quantize(self, x, st_idx=None, end_idx=None):
-        if self.ready():
-            if st_idx is not None and end_idx is not None:
-                scale = self.scale[st_idx:end_idx]
-                zero = self.zero[st_idx:end_idx]
-            else:
-                scale = self.scale
-                zero = self.zero
-            return self._quantize(x, scale, zero, self.maxq)
+        # if self.ready():
+        #     if st_idx is not None and end_idx is not None:
+        #         scale = self.scale[st_idx:end_idx]
+        #         zero = self.zero[st_idx:end_idx]
+        #     else:
+        scale = self.scale
+        zero = self.zero
+        return self._quantize(x, scale, zero, self.maxq)
 
         return x
 

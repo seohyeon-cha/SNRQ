@@ -49,10 +49,10 @@ MODEL_PATH="meta-llama/Meta-Llama-3-8B"
 
 ALPHA=0.5
 BETA=0.0003
-ALPHA_METHOD="fixed"
+ALPHA_METHOD="optimize"
 MIXUP=5.0
-WBITS_VALUES=(3)
-SEEDS=(1 2 3 4)
+WBITS_VALUES=(4)
+SEEDS=(0 1 2 3 4)
 
 DATE=$(date +"%Y%m%d")
 mkdir -p logs/l3-8b
@@ -77,13 +77,11 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --alpha-method ${ALPHA_METHOD} \
       --alpha ${ALPHA} \
       --mixup-param ${MIXUP} \
-      --incoh-process \
-      --incoh-mode had \
       --eval \
       --lm-eval \
-      --plot-delta-x-path "${BASE_PLOT_PATH}" \
+      --beam-size 1 \
       --wandb \
-      --wandb-project Optimize-Alpha-Incoh \
+      --wandb-project L3-8B-symm-new \
       --wandb-name L3-8B_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"

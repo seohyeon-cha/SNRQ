@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 0:30:00     
+#SBATCH -t 2:30:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -44,13 +44,16 @@ cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 
 MODEL_PATH="meta-llama/Llama-2-7b-hf"
 
-ALPHA=0.2
+ALPHA=0.5
 BETA=0.0003
 BETA_KD=1e-3
-N_LAYERS_TO_UPDATE=30
+N_LAYERS_TO_UPDATE=32
+ALPHA_METHOD="sample"
+MIXUP=5.0
 
 WBITS_VALUES=(3)
-SEEDS=(2)
+SEEDS=(0 1 2 3 4)
+BEAM=2
 
 DATE=$(date +"%Y%m% d")
 mkdir -p logs/l2-7b
@@ -78,9 +81,13 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --nsamples 128 \
       --eval \
       --lm-eval \
-      --kd-T 2.0 \
-      --wandb-project L2-7B-KD-test \
-      --wandb-name greedyaq_forwardkd_${N_LAYERS_TO_UPDATE}layers_${wbits}bit_seed${seed}"
+      --beam-size ${BEAM} \
+      --beam-cands 4 \
+      --alpha-method sample \
+      --mixup-param ${MIXUP} \
+      --wandb \
+      --wandb-project Beam-Search-Block-1226 \
+      --wandb-name greedyaq_beam${BEAM}_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

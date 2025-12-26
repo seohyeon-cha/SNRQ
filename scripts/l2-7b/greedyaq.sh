@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
+#SBATCH -t 1:30:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -42,15 +42,15 @@ PY
 
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 
-BASE_PLOT_PATH="plots/alpha/l2-7b/3bits_g128_fix"
+BASE_PLOT_PATH="plots/alpha/l2-7b/3bits_g128_sample"
 mkdir -p "${BASE_PLOT_PATH}"
 
 MODEL_PATH="meta-llama/Llama-2-7b-hf"
 ALPHA=0.5
-ALPHA_METHOD="fixed"
+ALPHA_METHOD="sample"
 MIXUP=5.0
 BETA=0.0003
-WBITS_VALUES=(3)
+WBITS_VALUES=(2)
 SEEDS=(0 1 2 3 4)
 
 DATE=$(date +"%Y%m%d") 
@@ -70,20 +70,19 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --sym \
       --wbits $wbits \
       --true-sequential \
-      --groupsize -1 \
+      --groupsize 128 \
       --seed $seed \
       --alpha-method ${ALPHA_METHOD} \
       --alpha ${ALPHA} \
       --nsamples 128 \
-      --eval \
-      --lm-eval \
-      --incoh-process \
-      --incoh-mode had \
+      --cd_passes 0 \
+      --beam-size 1 \
       --mixup-param ${MIXUP} \
-      --plot-delta-x-path "${BASE_PLOT_PATH}" \
+      --lm-eval \
+      --eval \
       --wandb \
-      --wandb-project Optimize-Alpha-Incoh \
-      --wandb-name L2-7B_nogroup_${wbits}bit_seed${seed}"
+      --wandb-project Beam-Search-Block-1226 \
+      --wandb-name L2-7B-${wbits}bit_seed${seed}" \
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

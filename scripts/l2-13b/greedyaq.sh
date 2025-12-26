@@ -4,8 +4,8 @@
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
 #SBATCH -t 2:30:00     
-#SBATCH --output=slurm_out/l3-7b-test-greedyaq_%j.out
-#SBATCH --error=slurm_out/l3-7b-test-greedyaq_%j.err
+#SBATCH --output=slurm_out/l2-13b-test-greedyaq_%j.out
+#SBATCH --error=slurm_out/l2-13b-test-greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=seohyeon.cha@utexas.edu
 
@@ -50,9 +50,9 @@ MODEL_PATH="meta-llama/Llama-2-13b-hf"
 
 ALPHA=0.5
 BETA=0.0003
-ALPHA_METHOD="sample"
+ALPHA_METHOD="optimize"
 MIXUP=5.0
-WBITS_VALUES=(3)
+WBITS_VALUES=(4)
 SEEDS=(0 1 2 3 4)
 
 DATE=$(date +"%Y%m%d")
@@ -80,12 +80,11 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --mixup-param ${MIXUP} \
       --eval \
       --lm-eval \
-      --incoh-process \
-      --incoh-mode had \
+      --beam-size 1 \
       --plot-delta-x-path "${BASE_PLOT_PATH}" \
       --wandb \
-      --wandb-project Sample-Alpha-Incoh \
-      --wandb-name L2-13B_module_${wbits}bit_seed${seed}"
+      --wandb-project L2-13B-symm-new \
+      --wandb-name L2-13B_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

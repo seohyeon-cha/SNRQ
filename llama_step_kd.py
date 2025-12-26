@@ -10,7 +10,7 @@ import logging
 from transformers import LlamaConfig, LlamaForCausalLM, modeling_utils
 from algorithms.gptq import GPTQ
 from algorithms.gptaq import GPTAQ
-from algorithms.greedyaq import GreedyAQ
+from algorithms.greedyaq_rowwise import GreedyAQ
 from algorithms.foem import FOEM
 from algorithms.guidedquant import GuidedQuant
 from algorithms.gptq import Observer  # Observer is the same across all algorithms
@@ -40,7 +40,7 @@ def llama_sequential(model,
                      dev,
                      fp_path,
                      teacher_model=None,   # <--- new
-                     T=None, 
+                     gradients=None,
                      args=None):              # KD temperature (optional override)
     """
     Sequential LLaMA quantization with *per-layer* KD refinement.
@@ -116,7 +116,6 @@ def llama_sequential(model,
         fp_inps = inps.clone()
 
     # KD parameters
-    kd_T = T if T is not None else getattr(args, "kd_T", 1.0)
     use_layerwise_kd = (
         teacher_model is not None
         and args.method == "greedyaq"
@@ -141,6 +140,9 @@ def llama_sequential(model,
                 dev=dev, args=args
             )
 
+    error_total = 0
+    count = 0
+    error_store = {}
     for i in range(len(layers)):
         if args.method == "guidedq":
             saliency_dict = torch.load(os.path.join(saliency_path, f"l{i}.pt"))
@@ -173,6 +175,7 @@ def llama_sequential(model,
 
             gptq = {}
             for name in subset_student:
+                
                 if args.method == "gptaq":
                     gptq[name] = GPTAQ(subset_student[name], observe=args.observe)
                 elif args.method == "greedyaq":
@@ -232,6 +235,7 @@ def llama_sequential(model,
             for name in subset_student:
                 if args.method == "greedyaq":
                     # first pass: gradient=None
+                    gradient = gradients[i][name] if (gradients is not None) else None
                     scale, zero, g_idx, error = gptq[name].fasterquant(
                         percdamp=args.percdamp,
                         groupsize=args.groupsize,
@@ -239,9 +243,16 @@ def llama_sequential(model,
                         name=name,
                         alpha=args.alpha,
                         beta=args.beta,
-                        gradient=None,   # <-- no KD yet
+                        gradient=gradient,  
                         args=args
                     )
+                    error_total += error 
+                    count += 1
+                    if i == 0:
+                        error_store[name] = []
+                    else:
+                        error_store[name].append(error)
+                
                 elif args.method == "guidedq":
                     scale, zero, g_idx, error = gptq[name].fasterquant(
                         percdamp=args.percdamp,
@@ -279,68 +290,6 @@ def llama_sequential(model,
                 for name in subset_student:
                     gptq[name].free()
 
-        
-        # ---- KD-based SECOND PASS on this layer ----
-        if args.method == "greedyaq" and use_layerwise_kd and i >= len(layers)-args.n_layers_to_update:
-            # Compute KD gradients for current partially quantized model
-            with torch.enable_grad():
-                kd_gradients, _ = gradient_utils.get_kd_gradients(
-                    teacher_model,
-                    model,
-                    dataloader,
-                    num_batches=args.nsamples,
-                    T=kd_T,
-                    save_path=None,
-                    dev=dev, args=args
-                )
- 
-            # Re-quantize modules in layer i with KD gradients
-            full_layer = teacher_model.model.layers[i]
-            full_sub = find_layers(full_layer)
-
-            for names in sequential:
-                subset = {n: full_sub[n] for n in names if n in full_sub}
-
-                for name in subset:
-                    qobj = layer_gptq[name]
-                    qobj.layer.weight.data = full_sub[name].weight.data.clone() # re-initialize to teacher model weight 
-                    kd_gradient = kd_gradients[i][name]
-
-                    # Second pass: same H / dXXT, now with gradient
-                    scale, zero, g_idx, error = qobj.fasterquant(
-                        percdamp=args.percdamp,
-                        groupsize=args.groupsize,
-                        actorder=args.act_order,
-                        name=name,
-                        alpha=args.alpha,
-                        beta=args.beta,
-                        gradient=kd_gradient,
-                        args=args
-                    )
-
-                    quantizers[f'model.layers.{i}.{name}'] = (
-                        qobj.quantizer.cpu(),
-                        scale.cpu(), zero.cpu(), g_idx.cpu(),
-                        args.wbits, args.groupsize
-                    )
-
-                    if args.observe:
-                        observer.submit(name=name, layerid=i, gptq=qobj, error=error)
-
-                    
-                    if not args.observe:
-                        qobj.free()
-            
-            # After KD second pass, ensure layer is back on dev for forward pass
-            # get_kd_gradients moves the entire model to CPU, so we need to move layer back
-            layer = layer.to(dev)
-            # Also ensure inps, attention_mask, and position_ids are on the correct device
-            inps = inps.to(dev)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(dev)
-            if position_ids is not None:
-                position_ids = position_ids.to(dev)
-
         print('+------------------+--------------+------------+-----------+-------+')
         print('\n')
 
@@ -363,6 +312,11 @@ def llama_sequential(model,
 
     end_time = time.time()
     print(f'time cost: {end_time - begin_time}s')
+    print(f'Average weight error: {error_total / count}')
+    out = {}
+    for k, v in error_store.items():
+        out[k] = sum(v) / len(v)
+    print(f'Average Cost per module: {out}')
 
     if args.observe:
         observer.print()
@@ -680,13 +634,19 @@ if __name__ == '__main__':
     parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
     parser.add_argument('--step', action='store_true', help='')
     parser.add_argument('--step_bits', type=int, default=8)
+    parser.add_argument('--use_ce_loss', action='store_true', help='Whether to reverse the KD direction.')
     parser.add_argument('--reverse-kd', action='store_true', help='Whether to reverse the KD direction.')
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
+    parser.add_argument('--alpha-method', type=str, default="fixed", choices=["fixed", "sample", "optimize"], help='Coefficient for weight correction term')
+    parser.add_argument('--mixup-param', type=float, default=5.0, help='Coefficient for weight correction term')
+    parser.add_argument('--beam-size', type=int, default=1, help='Coefficient for weight correction term')
+    parser.add_argument('--beam-cands', type=int, default=128, help='Coefficient for weight correction term')
+
     parser.add_argument('--beta', type=float, default=0.0003, help='Coefficient for weight correction term')
     parser.add_argument('--n_layers_to_update', type=int, default=5, help='Number of layers to update in second quantization.')
     parser.add_argument('--incoh-process', action='store_true', help='Whether to perform incoherence process.')
-    parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
+    parser.add_argument('--incoh-mode', type=str, default='had', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
     parser.add_argument('--rescale-WH', action='store_true', help='Whether to rescale W and H to minimize proxy loss.')
     parser.add_argument('--ours', action='store_true', help='Use our method')
     parser.add_argument('--ours_v2', action='store_true', help='Use our method')
@@ -703,7 +663,6 @@ if __name__ == '__main__':
     # Plotting removed for KD code
 
     args = parser.parse_args()
-
 
     # Initialize wandb if enabled
     if args.wandb:
@@ -730,6 +689,8 @@ if __name__ == '__main__':
                 'kd_beta': args.kd_beta,
                 'reverse_kd': args.reverse_kd, 
                 'guided_num_groups': args.guided_num_groups,
+                'beam_size': args.beam_size,
+                'beam_cands': args.beam_cands
             }
         )
 
@@ -755,12 +716,29 @@ if __name__ == '__main__':
         model = copy.deepcopy(teacher_model)
         model.eval()
 
+        torch.cuda.synchronize()
         tick = time.time()
-        quantizers = llama_sequential(model, dataloader, DEV, fp_path=None, teacher_model=teacher_model, T=args.kd_T, args=args)
+        quantizers = llama_sequential(model, dataloader, DEV, fp_path=None, teacher_model=teacher_model, args=args)
+
+        if args.use_ce_loss:
+            # Compute KD gradients for current partially quantized model
+            with torch.enable_grad():
+                if args.use_ce_loss:
+                    gradients, _ = gradient_utils.get_ce_gradients(
+                        model,
+                        dataloader,
+                        num_batches=args.nsamples,
+                        save_path=None,
+                        dev=DEV, args=args
+                    )
+            quantizers = llama_sequential(model, dataloader, DEV, fp_path=None, teacher_model=teacher_model, gradients=gradients, args=args)
+        
+        torch.cuda.synchronize()
         quant_time = time.time() - tick
         print(f"Quantization time: {quant_time}s")
         if args.wandb:
             wandb.log({'quantization_time': quant_time})
+
 
     if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]

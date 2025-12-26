@@ -1,6 +1,7 @@
 import math
 import os
 import time
+
 import logging
 import torch
 import torch.nn as nn
@@ -83,6 +84,7 @@ class GreedyAQ:
         self.sampled_alpha = sampled_alpha
         self.mixup_param = mixup_param
         self.seed = seed
+        torch.manual_seed(self.seed)
 
     def add_batch(self, inp, out):
         if self.observe:
@@ -110,7 +112,6 @@ class GreedyAQ:
         dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
         # I'll sample alpha here - from Beta distribution (to use different sampled alpha for different calibration sample)
         if self.sampled_alpha:
-            torch.manual_seed(self.seed)
             self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
             alpha = self._beta_dist.sample().item()
             alpha = min(alpha, 1-alpha)
@@ -124,6 +125,117 @@ class GreedyAQ:
             self.delta_x_values.append(abs_dX.cpu().clone())
         
         del self.fp_inp[0]
+
+
+    @torch.no_grad()
+    def _structured_nn_candidates(
+        self,
+        What_batch: torch.Tensor,   # [B, rows]
+        beam_cands: int,
+        m_mult: int = 2,            # m = m_mult * beam_cands ambiguous rows per beam
+    ):
+        """
+        Structured nearest-neighbor enumeration (sphere-decoding friendly):
+
+          q0 = Quantize(What)
+          Choose m ambiguous rows with smallest flip penalty
+          Consider single-row flips to q0 +/- scale
+          Keep the best (beam_cands-1) flips + baseline
+
+        Returns:
+          cands: [B, beam_cands, rows]   (float)
+          sse:   [B, beam_cands]         where sse[b,k] = ||What - cands||^2
+        """
+        assert What_batch.dim() == 2
+        B, R = What_batch.shape
+        device = What_batch.device
+        dtype = What_batch.dtype
+
+        # Baseline quantization: quantize expects [rows, ncols] in many GPTQ quantizers
+        q0 = self.quantizer.quantize(What_batch.t().contiguous()).t().contiguous()
+        q0 = q0.to(dtype)
+
+        # If no branching requested
+        if beam_cands <= 1:
+            base_sse = (What_batch - q0).square().sum(dim=1, keepdim=True)  # [B,1]
+            return q0.unsqueeze(1), base_sse
+
+        # Per-row step
+        if not hasattr(self.quantizer, "scale") or self.quantizer.scale is None:
+            base_sse = (What_batch - q0).square().sum(dim=1, keepdim=True)
+            return q0.unsqueeze(1), base_sse
+
+        s = self.quantizer.scale.reshape(-1).to(device=device, dtype=dtype)  # [R]
+        s_row = s.view(1, R)  # [1,R]
+
+        # Determine clamp range (symmetric)
+        q_plus = self.quantizer.quantize((q0 + s_row).t().contiguous()).t().contiguous().to(dtype)
+        q_minus = self.quantizer.quantize((q0 - s_row).t().contiguous()).t().contiguous().to(dtype)
+
+        # Base SSE
+        diff0 = What_batch - q0
+        base_err = diff0.square()                 # [B,R]
+        base_sse = base_err.sum(dim=1)            # [B]
+
+        # Flip penalties per entry (how much SSE increases if you flip that single row)
+        inf = torch.tensor(float("inf"), device=device, dtype=dtype)
+
+        # change in squared error 
+        dp = (What_batch - q_plus).square()  - base_err   # [B,R]
+        dm = (What_batch - q_minus).square() - base_err   # [B,R]
+
+        # Disallow "no-op" moves (saturated)
+        dp = torch.where(q_plus != q0, dp, inf)
+        dm = torch.where(q_minus != q0, dm, inf)
+
+        # Ambiguity score = min(dp, dm)
+        dmin = torch.minimum(dp, dm)  # [B,R]
+
+        # Select m ambiguous rows per beam
+        m = min(R, m_mult * beam_cands)
+        _, amb_idx = torch.topk(dmin, k=m, largest=False)  # [B,m]
+
+        dp_sel = dp.gather(1, amb_idx)  # [B,m]
+        dm_sel = dm.gather(1, amb_idx)  # [B,m]
+
+        # Now choose best (beam_cands-1) moves among the 2*m possibilities
+        move_cost = torch.cat([dp_sel, dm_sel], dim=1)  # [B,2m]
+        nn = min(beam_cands - 1, move_cost.shape[1])
+
+        vals, move = torch.topk(move_cost, k=nn, largest=False)  # [B,nn]
+        valid = torch.isfinite(vals)                             # [B,nn]
+
+        # Decode (row, direction)
+        is_minus = move >= m
+        local = move - is_minus.to(move.dtype) * m               # [B,nn]
+        row = amb_idx.gather(1, local)                           # [B,nn]
+
+        plus_val = q_plus.gather(1, row)                         # [B,nn]
+        minus_val = q_minus.gather(1, row)                       # [B,nn]
+        chosen_val = torch.where(is_minus, minus_val, plus_val)  # [B,nn]
+
+        # Build candidates: baseline + nn moves + (optional padding)
+        K = beam_cands
+        cands = q0.unsqueeze(1).repeat(1, K, 1)                  # [B,K,R]
+
+        sse = torch.empty((B, K), device=device, dtype=dtype)
+        sse[:, 0] = base_sse
+        sse[:, 1:1+nn] = base_sse.unsqueeze(1) + vals
+        if 1 + nn < K:
+            sse[:, 1+nn:] = base_sse.unsqueeze(1)  # pad with baseline SSE
+
+        # Apply single-row edits into candidates 1..nn
+        if nn > 0:
+            b = torch.arange(B, device=device).unsqueeze(1).expand(B, nn)      # [B,nn]
+            cid = torch.arange(1, 1 + nn, device=device).unsqueeze(0).expand(B, nn)
+
+            mask = valid
+            if mask.any():
+                cands[b[mask], cid[mask], row[mask]] = chosen_val[mask]
+            # invalid moves stay baseline automatically
+            
+        return cands, sse
+
 
 
     def print_loss(self, name, q_weight, alpha, timecost):
@@ -178,9 +290,8 @@ class GreedyAQ:
         self.dXXT[:, dead] = 0
         if G is not None:
             G[:, dead] = 0
-
+            
         D = self.dXXT.clone()
-        del self.dXXT
 
         if args.incoh_process:
             Hr, Dr, Wr, SU, SV, scaleWH = incoherence_preprocess(W, H, D, args)
@@ -201,48 +312,37 @@ class GreedyAQ:
         else:
             Mr = Hr + args.alpha * Dr
         
-        if not self.quantizer.ready():
-            self.quantizer.find_params(Wr, weight=True)
-        
         p = torch.argsort(torch.diag(Hr), descending=False) # sort based on column of X_t 
         inv_p = torch.argsort(p)
-        # P = torch.eye(Hr.shape[0], device=Hr.device)[:, p]
         Hp = Hr[p][:, p]
         Mp = Mr[p][:, p]
-
+        
         L = torch.linalg.cholesky(Hp)
         Hp_inv = torch.cholesky_inverse(L)
-
+        
         Delta_W = None
         if G is not None and beta != 0.0:
-            Delta_W = (0.5 * beta * G[:, p]) @ Hp_inv   # [rows, cols]
+            Gp = G[:, p]
+            Delta_W = (0.5 * beta * Gp) @ Hp_inv   # [rows, cols]
+
+        # L_diag = torch.diag(L)
+        # L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
+        # L = L - torch.eye(L.shape[0], device=L.device)
         
-        L_diag = torch.diag(L)
-        L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
-        L = L - torch.eye(L.shape[0], device=L.device)
-        del L_diag
+        L_diag = L.diagonal().clone() 
+        L.div_(L_diag.unsqueeze(0))
+        L.diagonal().zero_()
 
         C = Mp @ Hp_inv
         W_ref = Wr[:, p] @ C 
         del C, Mr
 
+        if not self.quantizer.ready():
+            self.quantizer.find_params(W_ref, weight=True)
+
         if Delta_W is not None:
             W_ref = W_ref - Delta_W
             del Delta_W
-
-        if getattr(args, "sort_asym", False):
-            H_diag = torch.diag(Hr)
-            W_norm2 = (W_ref ** 2).sum(dim=0)
-            scores = H_diag * W_norm2          # GPTQ-like
-            p_asym = torch.argsort(scores, descending=True)  # or False if you prefer
-            Hp = Hr[p_asym][:, p_asym]
-            W_ref = W_ref[:, p_asym]
-
-            L = torch.linalg.cholesky(Hp)
-            L_diag = torch.diag(L)
-            L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
-            L = L - torch.eye(L.shape[0], device=L.device)
-            del L_diag
 
         Q = torch.zeros_like(W_ref)
 
@@ -250,7 +350,8 @@ class GreedyAQ:
         scale = []
         zero = []
         seen_groups = set()  # Track which groups we've already saved
-        
+        gen = torch.Generator(device=W_ref.device)
+
         for i2 in range(self.columns, 0, -blocksize):
             i1 = max(i2 - blocksize, 0)
             count = i2 - i1
@@ -258,7 +359,8 @@ class GreedyAQ:
             W2diff = W_ref[:, i2:] - Q[:, i2:]
             What1 = Q[:, i1:i2].clone()
             L1 = L[:, i1:i2]
-            
+            tail_corr = W2diff @ L1[i2:, :]  
+
             for i in reversed(range(count)):
                 if groupsize != -1:
                     gstart = (i1 + i) // groupsize * groupsize
@@ -271,17 +373,108 @@ class GreedyAQ:
                         zero.append(self.quantizer.zero)
                         seen_groups.add(group_id)
 
-                What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + W2diff @ L1[i2:,i]
+                What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + tail_corr[:, i]
                 What1[:, i] = self.quantizer.quantize(What.unsqueeze(1)).flatten()
             Q[:, i1:i2] = What1
 
+       # =======================
+        # Post-LDLQ Coordinate Descent (optional)
+        # =======================
+        cd_passes = int(getattr(args, "cd_passes", 0))
+        if cd_passes > 0:
+            with torch.no_grad():
+                # IMPORTANT:
+                # At this point, Q and W_ref are in the SAME (possibly p_asym) order,
+                # and Hp is the Hessian in that same order. So we do CD here.
+                H_cd = Hp
+                H_cd = H_cd / H_cd.diag().max().clamp(min=1e-8)  # scale-invariant stabilization
 
-        if getattr(args, "sort_asym", False):
-            Q = Q[:, torch.argsort(p_asym)] # inverse perm
+                cols = self.columns
+                gs = cols if groupsize == -1 else groupsize
+
+                # residual in the LDLQ space
+                # (matches your snippet's s = w_hat - w)
+                s = Q - W_ref
+
+                for igp in range(cd_passes):
+                    any_change = False
+                    curr_gid = None
+
+                    for i2 in range(cols, 0, -blocksize):
+                        i1 = max(i2 - blocksize, 0)
+                        count = i2 - i1
+
+                        # local block copies
+                        W1 = Q[:, i1:i2].clone()
+                        S0 = s[:, :i1]                # view
+                        S1 = s[:, i1:i2].clone()
+                        S2 = s[:, i2:]                # view
+
+                        # Hessian block slices
+                        H0 = H_cd[:i1,  i1:i2]         # [i1, count]
+                        H1 = H_cd[i1:i2, i1:i2]        # [count, count]
+                        H2 = H_cd[i2:,  i1:i2]         # [cols-i2, count]
+
+                        # Precompute contribution from outside this block ONCE:
+                        # Hs_pre[:, j] = S0@H0[:,j] + S2@H2[:,j]
+                        Hs_pre = torch.zeros(
+                            (Q.shape[0], count), device=Q.device, dtype=Q.dtype
+                        )
+                        if i1 > 0:
+                            Hs_pre += S0 @ H0
+                        if i2 < cols:
+                            Hs_pre += S2 @ H2
+
+                        # Maintain S1 @ H1 incrementally (faster than recomputing each coord)
+                        S1H1 = S1 @ H1  # [rows, count]
+
+                        for ii in reversed(range(count)):
+                            col_abs = i1 + ii
+
+                            # Load quant params per group (same grouping rule as your greedy loop)
+                            if groupsize != -1:
+                                gid = col_abs // gs
+                                if gid != curr_gid:
+                                    curr_gid = gid
+                                    gstart = gid * gs
+                                    gend = min(gstart + gs, cols)
+                                    self.quantizer.find_params(W_ref[:, gstart:gend], weight=True)
+
+                            denom = H1[ii, ii].clamp(min=1e-8)
+
+                            # Hs = S0@H0[:,ii] + S1@H1[:,ii] + S2@H2[:,ii]
+                            # but we use:
+                            #   Hs_pre[:,ii] = S0@H0[:,ii] + S2@H2[:,ii]
+                            #   S1H1[:,ii]   = S1@H1[:,ii]
+                            Hs = Hs_pre[:, ii] + S1H1[:, ii]
+
+                            # Coordinate update + projection to quant grid
+                            proposal = W1[:, ii] - (Hs / denom)
+                            q_new = self.quantizer.quantize(proposal.unsqueeze(1)).flatten()
+
+                            eps = W1[:, ii] - q_new
+                            if torch.any(eps != 0):
+                                any_change = True
+
+                            # apply update (matches your snippet's W1 -= eps, S1 -= eps)
+                            W1[:, ii] = q_new
+                            S1[:, ii] -= eps
+
+                            # keep S1H1 consistent after changing S1[:, ii]
+                            # delta_s = -eps
+                            S1H1 += (-eps).unsqueeze(1) * H1[ii, :].unsqueeze(0)
+
+                        # write block back
+                        Q[:, i1:i2] = W1
+                        s[:, i1:i2] = S1
+
+                    if not any_change:
+                        # fixed point
+                        break
 
         Q = Q[:, inv_p].to(Q.device)
 
-        if args.alpha_method == "fixed":
+        if args.alpha_method == "optimize":
             first = ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj']
             if len(args.alpha_per_module[name]) == 1: 
                 alpha = args.alpha
@@ -296,14 +489,15 @@ class GreedyAQ:
             args.alpha_per_module[name].append(alpha)
             args.alpha_track.append(alpha)
 
-
         if args.incoh_process:
             Q = incoherence_process(Q, SU, SV, scaleWH, args)
+
         torch.cuda.synchronize()
 
         groupsize = groupsize if groupsize != -1 else self.columns
         g_idx = [i // groupsize for i in range(self.columns)]
         g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
+        g_idx = g_idx[inv_p] 
 
         if isinstance(self.layer, transformers.Conv1D):
             Q = Q.t()
@@ -325,337 +519,6 @@ class GreedyAQ:
 
         return scale, zero, g_idx, None
 
-
-    def fasterquant_alternating_method(
-            self, gradient=None, blocksize=128, percdamp=.01, groupsize=-1, name='', actorder=False,  alpha=0.25, args=None,
-    ):
-
-
-        W = self.layer.weight.data.clone()
-        W = W.float()
-
-        tick = time.time()
-
-        if not self.quantizer.ready():
-            self.quantizer.find_params(W, weight=True)
-
-        H = self.H
-        del self.H
-
-        G = None
-        if gradient is not None:
-            G = gradient.to(self.dev).float()
-            if isinstance(self.layer, nn.Conv2d):
-                G = G.flatten(1)
-
-        beta = getattr(args, "kd_beta", 1e-4) 
-        D = self.dXXT.clone()
-
-        dead = torch.diag(H) == 0
-        H[dead, dead] = 1
-        W[:, dead] = 0
-        self.dXXT[:, dead] = 0
-        # self.dXdXT[:, dead] = 0
-        if G is not None:
-            G[:, dead] = 0
-
-        if getattr(args, "rescale_D", False):
-            s = D.norm(dim=1)              # [d]
-            s = torch.clamp(s, min=1e-8)   
-            print(s) 
-            D = D / s[:, None]
-
-        if args.incoh_process:
-            Hr, Dr, Wr, SU, SV, scaleWH = incoherence_preprocess(W, H, D, args)
-        else:
-            Hr = H
-            Dr = D
-            Wr = W
-            SU = None
-            SV = None
-            scaleWH = None
-
-        damp = percdamp * torch.mean(torch.diag(Hr))
-        diag = torch.arange(self.columns, device=self.dev)
-        Hr[diag, diag] += damp 
-
-        p = torch.argsort(torch.diag(Hr), descending=False) # sort based on column of X_t 
-        inv_p = torch.argsort(p)
-        # P = torch.eye(Hr.shape[0], device=H.device)[:, p]
-        Hp = Hr[p][:, p]
-        L = torch.linalg.cholesky(Hp)
-  
-        Hp_inv = torch.cholesky_inverse(L)
-        
-        Delta_W = None
-        if G is not None and beta != 0.0:
-            Delta_W = (0.5 * beta * G[:, p]) @ Hp_inv   # [rows, cols]
-
-        L_diag = torch.diagonal(L)                    # view, no big alloc
-        L.div_(L_diag.unsqueeze(0))                   # in-place (no new [d,d])
-        L.fill_diagonal_(0.0)                         # in-place (no eye)
-        del L_diag 
-            
-        # L_diag = torch.diag(L)
-        # L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
-        # L = L - torch.eye(L.shape[0], device=L.device)
-        # del L_diag
-
-        W_ref = Wr.clone()
-        Q = torch.zeros_like(W_ref)
-
-        alpha_update = args.alpha
-        num_iterations = 2
-        best_error = float('inf')
-
-        for iter in range(num_iterations):
-            
-            Mr = Hr + alpha_update * Dr
-            C = Mr[:, p] @ Hp_inv
-            W_new = W_ref @ C 
-            if Delta_W is not None:
-                W_new = W_new - Delta_W
-
-            Q = torch.zeros_like(W_ref)
-
-            g_idx = []
-            scale = []
-            zero = []
-            seen_groups = set()  # Track which groups we've already saved
-            
-            for i2 in range(self.columns, 0, -blocksize):
-                i1 = max(i2 - blocksize, 0)
-                count = i2 - i1
-                W1 = W_new[:, i1:i2].clone()
-                W2diff = W_new[:, i2:] - Q[:, i2:]
-                What1 = Q[:, i1:i2].clone()
-                L1 = L[:, i1:i2]
-                
-                for i in reversed(range(count)):
-                    if groupsize != -1:
-                        gstart = (i1 + i) // groupsize * groupsize
-                        gend   = min(gstart + groupsize, self.columns)
-                        group_id = (i1 + i) // groupsize
-
-                        if group_id not in seen_groups:
-                            self.quantizer.find_params(W_new[:, gstart:gend], weight=True)
-                            scale.append(self.quantizer.scale)
-                            zero.append(self.quantizer.zero)
-                            seen_groups.add(group_id)
-
-                    What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + W2diff @ L1[i2:,i]
-                    What1[:, i] = self.quantizer.quantize(What.unsqueeze(1)).flatten()
-                Q[:, i1:i2] = What1
-            
-            error = torch.trace((W_ref - Q[:, inv_p]) @ H @ ((W_ref - Q[:, inv_p]).t()))
-            error_val = error.item()
-            
-            if error_val >= best_error:
-                break
-            else:
-                best_error = error_val
-                diff = Q[:, inv_p] - W_ref
-                WD = W_ref @ D
-                num = torch.trace(diff.t() @ WD)
-                WD_P = WD[:, p]
-                denom = torch.trace(WD_P @ Hp_inv @ WD_P.t())
-                if denom != 0:
-                    alpha_update = torch.clamp(num / denom, 0, 1.0)
-                    print(f"Iteration {iter}: error {error_val:.6f}, alpha {alpha_update:.3f}")
-                else:
-                    break
-        
-        if ("down" in name or "o_proj" in name): # last layer of a block then update alpha 
-            name = name + f"_a{alpha_update:.2f}"
-            if "o_proj" in name: 
-                args.alpha_attn = alpha_update
-            if "down" in name:
-                args.alpha_mlp = alpha_update  
-            
-            args.alpha_track.append(alpha_update)
-
-        Q = Q[:, inv_p].to(Q.device)
-        if args.incoh_process:
-            Q = incoherence_process(Q, SU, SV, scaleWH, args)
-
-        torch.cuda.synchronize()
-        
-        groupsize = groupsize if groupsize != -1 else self.columns
-        g_idx = [i // groupsize for i in range(self.columns)]
-        g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
-        
-
-        if isinstance(self.layer, transformers.Conv1D):
-            Q = Q.t()
-        
-        # todo
-        self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
-            self.layer.weight.data.dtype
-        )
-
-        self.print_loss(name=name, q_weight=Q, alpha=alpha_update, timecost=(time.time() - tick))
-
-        if scale == []:
-            scale.append(self.quantizer.scale)
-            zero.append(self.quantizer.zero)
-        # Reverse scale and zero to match original column order since we processed in reverse
-        scale = torch.cat(scale[::-1], dim=1)
-        zero = torch.cat(zero[::-1], dim=1)
-        g_idx = g_idx[inv_p]
-
-        return scale, zero, g_idx, None
-    
-
-    # def fasterquant_alternating_method(
-    #         self, gradient=None, blocksize=128, percdamp=.01, groupsize=-1, name='', actorder=False,  alpha=0.25, args=None,
-    # ):
-
-
-    #     W = self.layer.weight.data.clone()
-    #     W = W.float()
-
-    #     tick = time.time()
-
-    #     if not self.quantizer.ready():
-    #         self.quantizer.find_params(W, weight=True)
-
-    #     H = self.H
-    #     del self.H
-
-    #     G = None
-    #     if gradient is not None:
-    #         G = gradient.to(self.dev).float()
-    #         if isinstance(self.layer, nn.Conv2d):
-    #             G = G.flatten(1)
-
-    #     beta = getattr(args, "kd_beta", 1e-4) 
-
-    #     dead = torch.diag(H) == 0
-    #     H[dead, dead] = 1
-    #     W[:, dead] = 0
-    #     self.dXXT[:, dead] = 0
-    #     if G is not None:
-    #         G[:, dead] = 0
-
-    #     damp = percdamp * torch.mean(torch.diag(H))
-    #     diag = torch.arange(self.columns, device=self.dev)
-    #     H[diag, diag] += damp
-
-    #     p = torch.argsort(torch.diag(H), descending=False) # sort based on column of X_t 
-    #     P = torch.eye(H.shape[0], device=H.device)[:, p]
-    #     Hp = H[p][:, p]
-    #     L = torch.linalg.cholesky(Hp)
-
-    #     D = self.dXXT.clone()
-
-    #     if torch.norm(D, 'fro') > 0:
-    #         norm_ratio = torch.norm(D, 'fro') / torch.norm(H, 'fro')
-    #         alpha = norm_ratio
-    #     else:
-    #         # If D is zero, use the provided alpha value
-    #         alpha = 0
-  
-    #     Hp_inv = torch.cholesky_inverse(L)
-        
-    #     Delta_W = None
-    #     if G is not None and beta != 0.0:
-    #         Delta_W = (0.5 * beta * G[:, p]) @ Hp_inv   # [rows, cols]
-        
-    #     L_diag = torch.diag(L)
-    #     L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
-    #     L = L - torch.eye(L.shape[0], device=L.device)
-    #     del L_diag
-
-    #     W_ref = W.clone()
-    #     Q = torch.zeros_like(W_ref)
-
-    #     alpha_update = 0.25
-    #     num_iterations = 3
-    #     best_error = float('inf')
-
-    #     for iter in range(num_iterations):
-            
-    #         M = H + alpha_update * D
-    #         C = M[:, p] @ Hp_inv
-    #         W_new = W_ref @ C 
-    #         if Delta_W is not None:
-    #             W_new = W_new - Delta_W
-
-    #         Q = torch.zeros_like(W_ref)
-
-    #         g_idx = []
-    #         scale = []
-    #         zero = []
-    #         seen_groups = set()  # Track which groups we've already saved
-            
-    #         for i2 in range(self.columns, 0, -blocksize):
-    #             i1 = max(i2 - blocksize, 0)
-    #             count = i2 - i1
-    #             W1 = W_new[:, i1:i2].clone()
-    #             W2diff = W_new[:, i2:] - Q[:, i2:]
-    #             What1 = Q[:, i1:i2].clone()
-    #             L1 = L[:, i1:i2]
-                
-    #             for i in reversed(range(count)):
-    #                 if groupsize != -1:
-    #                     gstart = (i1 + i) // groupsize * groupsize
-    #                     gend   = min(gstart + groupsize, self.columns)
-    #                     group_id = (i1 + i) // groupsize
-
-    #                     if group_id not in seen_groups:
-    #                         self.quantizer.find_params(W_new[:, gstart:gend], weight=True)
-    #                         scale.append(self.quantizer.scale)
-    #                         zero.append(self.quantizer.zero)
-    #                         seen_groups.add(group_id)
-
-    #                 What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + W2diff @ L1[i2:,i]
-    #                 What1[:, i] = self.quantizer.quantize(What.unsqueeze(1)).flatten()
-    #             Q[:, i1:i2] = What1
-            
-    #         error = torch.trace((W_new - Q) @ Hp @ (W_new - Q).t())
-    #         # error = torch.trace((W_ref - Q @ P.t()) @ H @ ((W_ref - Q @ P.t()).t()))
-    #         error_val = error.item()
-            
-    #         if error_val >= best_error:
-    #             break
-    #         else:
-    #             best_error = error_val
-    #             diff = Q @ P.t() - W_ref
-    #             num = torch.trace(diff.t() @ W_ref @ D)
-    #             denom = torch.trace(W_ref @ self.dXdXT @ W_ref.t())
-    #             if denom != 0:
-    #                 alpha_update = torch.clamp(num / denom, 0.05, args.alpha)
-    #                 print(f"Iteration {iter}: error {error_val:.6f}, alpha {alpha_update:.3f}")
-    #             else:
-    #                 break
-
-    #     Q = Q @ P.t().to(Q.device)
-        
-    #     torch.cuda.synchronize()
-        
-    #     groupsize = groupsize if groupsize != -1 else self.columns
-    #     g_idx = [i // groupsize for i in range(self.columns)]
-    #     g_idx = torch.tensor(g_idx, dtype=torch.int32, device=Q.device)
-        
-
-    #     if isinstance(self.layer, transformers.Conv1D):
-    #         Q = Q.t()
-        
-    #     # todo
-    #     self.layer.weight.data = Q.reshape(self.layer.weight.shape).to(
-    #         self.layer.weight.data.dtype
-    #     )
-
-    #     self.print_loss(name=name, q_weight=Q, alpha=alpha_update, timecost=(time.time() - tick))
-
-    #     if scale == []:
-    #         scale.append(self.quantizer.scale)
-    #         zero.append(self.quantizer.zero)
-    #     # Reverse scale and zero to match original column order since we processed in reverse
-    #     scale = torch.cat(scale[::-1], dim=1)
-    #     zero = torch.cat(zero[::-1], dim=1)
-    #     return scale, zero, g_idx, None
- 
 
     def free(self):
         self.inp1 = None

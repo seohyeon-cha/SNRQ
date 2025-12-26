@@ -47,11 +47,11 @@ mkdir -p "${BASE_PLOT_PATH}"
 
 MODEL_PATH="meta-llama/Llama-2-70b-hf"
 ALPHA=0.0
-ALPHA_METHOD="fixed"
+ALPHA_METHOD="sample"
 MIXUP=5
 BETA=0.0003
 WBITS_VALUES=(3)
-SEEDS=(0)
+SEEDS=(2)
 
 DATE=$(date +"%Y%m%d") 
 
@@ -76,13 +76,11 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --alpha ${ALPHA} \
       --nsamples 128 \
       --eval \
-      --lm-eval \
-      --lm-eval-batch-size 4 \
       --mixup-param ${MIXUP} \
-      --plot-delta-x-path "${BASE_PLOT_PATH}" \
+      --save_safetensors saved_quant/l2-70b/greedyaq.safetensors \
       --wandb \
       --wandb-project L2-70B-symm-new \
-      --wandb-name greedyaq_0.25ref_${wbits}bit_seed${seed}"
+      --wandb-name greedyaq_sample_5_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

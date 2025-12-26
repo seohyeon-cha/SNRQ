@@ -253,6 +253,124 @@ def get_saliency_gradients(
     return gradients
 
 
+def get_ce_gradients(
+        student_model,
+        dataloader,
+        num_batches=None,      # how many batches from dataloader to use           
+        save_path=None,
+        dev='cpu',
+        args=None
+):
+    """
+    Compute squared-gradient accumulations of KD loss for the *quantized* student.
+
+    Loss: KL( softmax(y_teacher / T) || softmax(y_student / T) ) * T^2
+
+    Returns:
+        gradients, sensitivities: same structure as get_opt_gradients
+        gradients[i][module_name] is the (squared) grad for that layer/module.
+    """
+    # if save_path is not None and os.path.isfile(save_path):
+    #     logging.info(f"KD gradients already calculated and saved at {save_path}.")
+    #     logging.info("Loading KD gradients...")
+    #     return torch.load(save_path, weights_only=False)
+
+    logging.info("Calculating KD gradients for quantized OPT model...")
+
+    student_model.train()
+    student_model.zero_grad(set_to_none=True)
+
+    layers = student_model.model.layers
+
+    # Hook: square the gradient before it is stored in .grad
+    def grad_hook(grad):
+        return grad
+
+    hooks = []
+
+    sequential = [
+                ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
+                ['self_attn.o_proj'],
+                ['mlp.up_proj', 'mlp.gate_proj'],
+                ['mlp.down_proj']
+            ]
+    
+    # Register hooks on the *same* modules you quantize (Linear/Conv in each decoder layer)
+    for layer in layers:
+        full = modelutils.find_layers(layer, layers=[torch.nn.Linear])
+        for names in sequential: 
+            subset = {n: full[n] for n in names}
+            for module in subset.values():
+                hooks.append(module.weight.register_hook(grad_hook))
+
+
+    # Iterate over calibration batches and accumulate squared grads
+    if num_batches is None:
+        num_batches = len(dataloader)
+
+    logging.info(f"Using {num_batches} batches from dataloader for gradient estimation.")
+
+    student_model = student_model.to(dev)
+
+    batch_iter = iter(dataloader)
+    for b_idx in tqdm(range(num_batches), desc="Calculating KD gradients"):
+        try:
+            batch = next(batch_iter)
+        except StopIteration:
+            break
+
+        # your dataloader from get_loaders returns (tokens, _)
+        tokens = batch[0].to(dev)
+        # make sure sequence length matches model.seqlen
+        tokens = tokens[:, :student_model.seqlen]
+
+        # Teacher forward (no grad)
+        # Student forward (quantized model, with grad)
+        s_out = student_model(input_ids=tokens, labels=tokens)
+        loss = s_out.loss
+        loss.backward()
+
+    for hook in hooks:
+        hook.remove()
+    
+    # Harvest gradients per decoder layer / module BEFORE moving models to CPU
+    # This ensures gradients are on the correct device
+    gradients = []
+    sensitivities = []
+
+    for layer in layers:
+        full = modelutils.find_layers(layer, layers=[torch.nn.Linear])
+        grads_per_layer = {}
+        sensitivity_per_layer = {}
+        for names in sequential: 
+            subset = {n: full[n] for n in names}
+            for module_name, module in subset.items():
+                grads_per_layer[module_name] = None
+                sensitivity_per_layer[module_name] = None
+                if module.weight.grad is not None:
+                    grad = module.weight.grad.detach().clone().cpu()
+                    grads_per_layer[module_name] = grad
+                    sensitivity_per_layer[module_name] = grad.abs()
+        gradients.append(grads_per_layer)
+        sensitivities.append(sensitivity_per_layer)
+    
+    # Move models to CPU after harvesting gradients
+    student_model.cpu()
+
+    stored = [gradients, sensitivities]
+    if save_path is not None:
+        logging.info(f"Saving CE gradients to {save_path}...")
+        if not save_path.endswith('.pt'):
+            save_path = save_path + '.pt'
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        if os.path.exists(save_path):
+            logging.warning(f"[WARNING] File {save_path} already exists. Overwriting.")
+        torch.save(stored, save_path)
+
+    return stored
+
+
+
 def get_kd_gradients(
         teacher_model,
         student_model,

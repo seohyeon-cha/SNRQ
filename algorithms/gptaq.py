@@ -149,9 +149,6 @@ class GPTAQ:
 
         tick = time.time()
 
-        if not self.quantizer.ready():
-            self.quantizer.find_params(W, weight=True)
-
         H = self.H
         dead = torch.diag(H) == 0
         H[dead, dead] = 1
@@ -174,6 +171,9 @@ class GPTAQ:
             Wr = Wr[:, perm]
             Hr = Hr[perm][:, perm]
             Dr= Dr[perm][:, perm]
+
+        if not self.quantizer.ready():
+            self.quantizer.find_params(Wr, weight=True)
 
         Losses = torch.zeros_like(Wr)
         Q = torch.zeros_like(Wr)
