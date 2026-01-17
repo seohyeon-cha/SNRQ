@@ -51,7 +51,7 @@ ALPHA=0.5
 BETA=0.0003
 ALPHA_METHOD="optimize"
 MIXUP=5.0
-WBITS_VALUES=(4)
+WBITS_VALUES=(3)
 SEEDS=(0 1 2 3 4)
 
 DATE=$(date +"%Y%m%d")
@@ -81,7 +81,7 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --lm-eval \
       --beam-size 1 \
       --wandb \
-      --wandb-project L3-8B-symm-new \
+      --wandb-project Quant-time-optimize \
       --wandb-name L3-8B_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"

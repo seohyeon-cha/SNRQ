@@ -165,7 +165,10 @@ class GPTAQ:
             SU = None
             SV = None
             scaleWH = None
-
+        
+        del W, H
+        torch.cuda.empty_cache()
+        
         if actorder:
             perm = torch.argsort(torch.diag(Hr), descending=True)
             Wr = Wr[:, perm]
@@ -175,8 +178,6 @@ class GPTAQ:
         if not self.quantizer.ready():
             self.quantizer.find_params(Wr, weight=True)
 
-        Losses = torch.zeros_like(Wr)
-        Q = torch.zeros_like(Wr)
 
         # import pdb; pdb.set_trace()
         damp = percdamp * torch.mean(torch.diag(Hr))
@@ -186,6 +187,10 @@ class GPTAQ:
         Hr = torch.cholesky_inverse(Hr)
         Hr = torch.linalg.cholesky(Hr, upper=True)
         Hinv = Hr
+        del Hr 
+        
+        Losses = torch.zeros_like(Wr)
+        Q = torch.zeros_like(Wr)
 
         g_idx = []
         scale = []

@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 1:30:00     
+#SBATCH -t 2:00:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -47,10 +47,10 @@ mkdir -p "${BASE_PLOT_PATH}"
 
 MODEL_PATH="meta-llama/Llama-2-7b-hf"
 ALPHA=0.5
-ALPHA_METHOD="sample"
+ALPHA_METHOD="optimize"
 MIXUP=5.0
 BETA=0.0003
-WBITS_VALUES=(2)
+WBITS_VALUES=(3)
 SEEDS=(0 1 2 3 4)
 
 DATE=$(date +"%Y%m%d") 
@@ -81,7 +81,7 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --lm-eval \
       --eval \
       --wandb \
-      --wandb-project Beam-Search-Block-1226 \
+      --wandb-project Quant-time-optimize \
       --wandb-name L2-7B-${wbits}bit_seed${seed}" \
     
     echo "Executing command: $CMD"

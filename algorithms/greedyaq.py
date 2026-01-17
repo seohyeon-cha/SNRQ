@@ -10,6 +10,7 @@ import quant
 from texttable import Texttable
 from utils import torch_snr_error
 import utils.quip_utils as quip_utils
+from utils.plot_diagonal import plot_diagonal
 
 torch.backends.cuda.matmul.allow_tf32 = False
 torch.backends.cudnn.allow_tf32 = False
@@ -105,11 +106,12 @@ class GreedyAQ:
 
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.dXXT *= self.nsamples / (self.nsamples + tmp)
-        # self.dXdXT *= self.nsamples / (self.nsamples + tmp)
+
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
         dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
+        
         # I'll sample alpha here - from Beta distribution (to use different sampled alpha for different calibration sample)
         if self.sampled_alpha:
             self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
@@ -292,6 +294,7 @@ class GreedyAQ:
             G[:, dead] = 0
             
         D = self.dXXT.clone()
+        del self.dXXT 
 
         if args.incoh_process:
             Hr, Dr, Wr, SU, SV, scaleWH = incoherence_preprocess(W, H, D, args)
@@ -329,6 +332,10 @@ class GreedyAQ:
         # L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
         # L = L - torch.eye(L.shape[0], device=L.device)
         
+        # I want to check diagonal dominance 
+        # plot the diagonal value v.s. sum of off-diagonal values for each row of L 
+        # plot_diagonal(L.t(), layer_name=name)
+
         L_diag = L.diagonal().clone() 
         L.div_(L_diag.unsqueeze(0))
         L.diagonal().zero_()
@@ -479,13 +486,21 @@ class GreedyAQ:
             if len(args.alpha_per_module[name]) == 1: 
                 alpha = args.alpha
             else:
-                diff = Q - Wr
                 WD = Wr @ Dr
-                num = torch.trace(diff.t() @ WD).float()
+                if "70" in args.model:
+                    num = self.frob_inner_chunked(Q, WD) - self.frob_inner_chunked(Wr, WD)
+                else:
+                    diff = Q - Wr
+                    num = torch.trace(diff.t() @ WD).float()
+                    del diff
+                del Wr, Dr
                 WDP = WD[:, p]
-                denom = torch.trace((WDP @ Hp_inv) @ WDP.t()).float()
+                del WD
+                tmp = WDP @ Hp_inv      # [rows, cols]
+                denom = (tmp * WDP).sum()
+                # denom = torch.trace((WDP @ Hp_inv) @ WDP.t()).float()
                 alpha = torch.clamp(num / denom, 0.0, 1.0).item()    
-                del WD, WDP, diff, Wr, Dr, Hp_inv
+                del WDP, Hp_inv
             args.alpha_per_module[name].append(alpha)
             args.alpha_track.append(alpha)
 
@@ -507,7 +522,7 @@ class GreedyAQ:
             self.layer.weight.data.dtype
         )
 
-        self.print_loss(name=name, q_weight=Q, alpha=args.alpha, timecost=(time.time() - tick))
+        self.print_loss(name=name, q_weight=Q, alpha=alpha, timecost=(time.time() - tick))
         
         if scale == []:
             scale.append(self.quantizer.scale)
@@ -519,13 +534,20 @@ class GreedyAQ:
 
         return scale, zero, g_idx, None
 
+    def frob_inner_chunked(self, A, B, col_bs=2048):
+        # returns sum_{i,j} A_ij * B_ij in float32 without big intermediates
+        assert A.shape == B.shape
+        out = torch.zeros((), device=A.device, dtype=torch.float32)
+        for c0 in range(0, A.shape[1], col_bs):
+            c1 = min(c0 + col_bs, A.shape[1])
+            out += (A[:, c0:c1] * B[:, c0:c1]).sum(dtype=torch.float32)
+        return out
 
     def free(self):
         self.inp1 = None
         self.out1 = None
         self.H = None
         self.dXXT = None 
-        self.Losses = None
         self.Trace = None
         torch.cuda.empty_cache()
 

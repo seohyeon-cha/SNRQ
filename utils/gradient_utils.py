@@ -460,11 +460,7 @@ def get_kd_gradients(
         teacher_log_prob = F.log_softmax(teacher_logits / T, dim=-1)
         student_log_prob = F.log_softmax(student_logits / T, dim=-1)
 
-        # classic KD scaling by T^2
-        if args.reverse_kd:
-            loss_kd = F.kl_div(teacher_log_prob, student_log_prob, log_target=True, reduction="batchmean") * (T * T)
-        else:
-            loss_kd = F.kl_div(student_log_prob, teacher_log_prob, log_target=True, reduction="batchmean") * (T * T)
+        loss_kd = F.kl_div(student_log_prob, teacher_log_prob, log_target=True, reduction="batchmean") * (T * T)
         loss_kd.backward()
 
         # Optional: sanitize grads in-place after this batch

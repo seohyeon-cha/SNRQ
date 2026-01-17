@@ -5,14 +5,12 @@ import torch
 import torch.nn as nn
 import quant
 import os
-import logging
 
 from transformers import LlamaConfig, LlamaForCausalLM, modeling_utils
 from algorithms.gptq import GPTQ
 from algorithms.gptaq import GPTAQ
-from algorithms.greedyaq_rowwise import GreedyAQ
+from algorithms.greedyaq import GreedyAQ
 from algorithms.foem import FOEM
-from algorithms.guidedquant import GuidedQuant
 from algorithms.gptq import Observer  # Observer is the same across all algorithms
 from utils import find_layers, DEV, get_loaders, export_quant_table, gen_conditions
 from texttable import Texttable
@@ -20,6 +18,13 @@ import copy
 import transformers
 import utils
 from utils import gradient_utils
+
+def parse_layers_to_update(args, n_layers: int):
+
+    # fallback: if "sensitive" is requested but you haven't implemented it here
+    # use last-k as a safe default
+    k = int(getattr(args, "n_layers_to_update", 0))
+    return set(range(max(0, n_layers - k), n_layers))
 
 
 def get_llama(model):
@@ -35,43 +40,38 @@ def get_llama(model):
     return model
 
 @torch.no_grad()
-def llama_sequential(model,
-                     dataloader,
-                     dev,
-                     fp_path,
-                     teacher_model=None,   # <--- new
-                     gradients=None,
-                     args=None):              # KD temperature (optional override)
-    """
-    Sequential LLaMA quantization with *per-layer* KD refinement.
+def llama_sequential(
+    student_model,
+    dataloader,
+    dev,
+    teacher_model=None,
+    args=None,
+    kd_gradients=None,            # dict[layer_idx][module_name] -> grad tensor
+    requantize_layers=None,       # set of layer indices to requantize in pass2
+    mode="quantize",              # "quantize" (pass1) or "requantize" (pass2)
+):
+    assert mode in ["quantize", "requantize"]
+    if args.method in ["gptaq", "greedyaq"]:
+        assert teacher_model is not None, "teacher_model is required for gptaq/greedyaq to build fp_inp cache."
 
-    For each layer i:
-        1) Quantize layer i (GreedyAQ / GPTQ / etc.) using Hessian statistics.
-        2) With layers [0..i] quantized and [i+1..L] still FP, compute KD gradients
-           for the current student vs teacher_model (KL at the output).
-        3) Run a SECOND GreedyAQ.fasterquant pass on layer i using G = d(KL)/dW_i.
-    """
+    use_cache = student_model.config.use_cache
+    student_model.config.use_cache = False
+    layers_s = student_model.model.layers
+    n_layers = len(layers_s)
 
-    print('Starting ...')
+    # ---------- capture student inputs to layer0 ----------
+    student_model.model.embed_tokens = student_model.model.embed_tokens.to(dev)
+    student_model.model.norm = student_model.model.norm.to(dev)
+    layers_s[0] = layers_s[0].to(dev)
 
-    use_cache = model.config.use_cache
-    model.config.use_cache = False
-    layers = model.model.layers
-
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
-    
-    dtype = next(iter(model.parameters())).dtype
-    inps = torch.zeros((args.nsamples, model.seqlen, model.config.hidden_size),
+    dtype = next(iter(student_model.parameters())).dtype
+    inps = torch.zeros((args.nsamples, student_model.seqlen, student_model.config.hidden_size),
                        dtype=dtype, device=dev)
     cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
 
-    class Catcher(nn.Module):
-        def __init__(self, module):
-            super().__init__()
-            self.module = module
 
+    class Catcher(nn.Module):
+        def __init__(self, module): super().__init__(); self.module = module
         def forward(self, inp, **kwargs):
             inps[cache['i']] = inp
             cache['i'] += 1
@@ -79,41 +79,74 @@ def llama_sequential(model,
             cache['position_ids'] = kwargs['position_ids']
             raise ValueError
 
-    layers[0] = Catcher(layers[0].cuda())
+    layers_s[0] = Catcher(layers_s[0])
     for batch in dataloader:
         try:
-            model(batch[0].to(dev).cuda())
+            student_model(batch[0].to(dev))
         except ValueError:
             pass
-    layers[0] = layers[0].module
+    layers_s[0] = layers_s[0].module
 
-    layers[0] = layers[0].cpu()
-    model.model.embed_tokens = model.model.embed_tokens.cpu()
-    model.model.norm = model.model.norm.cpu()
+    layers_s[0] = layers_s[0].cpu()
+    student_model.model.embed_tokens = student_model.model.embed_tokens.cpu()
+    student_model.model.norm = student_model.model.norm.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
 
-    model.model.rotary_emb = model.model.rotary_emb.to(dev)
-    bsz, seqlen = position_ids.shape
-    cache_position = torch.arange(seqlen, device=dev)
+    student_model.model.rotary_emb = student_model.model.rotary_emb.to(dev)
+    _, seqlen = position_ids.shape
+    dummy = torch.empty((1, seqlen, student_model.config.hidden_size), device=dev, dtype=inps.dtype)
+    position_embeddings = student_model.model.rotary_emb(dummy, position_ids)
 
-    # rotary_emb only needs x for dtype/device; values don't matter
-    dummy = torch.empty((1, seqlen, model.config.hidden_size), device=dev, dtype=inps.dtype)
 
-    # (cos, sin) tuple
-    position_embeddings = model.model.rotary_emb(dummy, position_ids)
+    # ---------- capture teacher inputs to layer0 (needed for fp_inp cache) ----------
+    if args.method in ["gptaq", "greedyaq"]:
+        teacher_model.config.use_cache = False
+        layers_t = teacher_model.model.layers
+        teacher_model.model.embed_tokens = teacher_model.model.embed_tokens.to(dev)
+        teacher_model.model.norm = teacher_model.model.norm.to(dev)
+        layers_t[0] = layers_t[0].to(dev)
 
-    print('Ready.')
+        fp_inps = torch.zeros_like(inps)
+        fp_cache = {'i': 0, 'attention_mask': None, 'position_ids': None}
+
+        class CatcherT(nn.Module):
+            def __init__(self, module): super().__init__(); self.module = module
+            def forward(self, inp, **kwargs):
+                fp_inps[fp_cache['i']] = inp
+                fp_cache['i'] += 1
+                fp_cache['attention_mask'] = kwargs['attention_mask']
+                fp_cache['position_ids'] = kwargs['position_ids']
+                raise ValueError
+
+        layers_t[0] = CatcherT(layers_t[0])
+        for batch in dataloader:
+            try:
+                teacher_model(batch[0].to(dev))
+            except ValueError:
+                pass
+        layers_t[0] = layers_t[0].module
+
+        layers_t[0] = layers_t[0].cpu()
+        teacher_model.model.embed_tokens = teacher_model.model.embed_tokens.cpu()
+        teacher_model.model.norm = teacher_model.model.norm.cpu()
+        torch.cuda.empty_cache()
+
+        # sanity: masks/pos match
+        # (they should, since same tokenization / seqlen)
+        fp_inputs_cache = utils.modelutils.FPInputsCache([
+            ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
+            ['self_attn.o_proj'],
+            ['mlp.up_proj', 'mlp.gate_proj'],
+            ['mlp.down_proj']
+        ])
 
     quantizers = {}
     observer = Observer()
-    begin_time = time.time()
 
-    # layer-wise module sequence (unchanged)
     sequential = [
         ['self_attn.k_proj', 'self_attn.v_proj', 'self_attn.q_proj'],
         ['self_attn.o_proj'],
@@ -121,135 +154,104 @@ def llama_sequential(model,
         ['mlp.down_proj']
     ]
 
-    if args.method in ["gptaq", "greedyaq"]:
-        fp_inputs_cache = utils.modelutils.FPInputsCache(sequential)
-        fp_inps = inps.clone()
+    if requantize_layers is None:
+        requantize_layers = set()
 
-    # KD parameters
-    use_layerwise_kd = (
-        teacher_model is not None
-        and args.method == "greedyaq"
-        and getattr(args, "kd_beta", 0.0) != 0.0
-    )
-
-    if args.method == "guidedq":
-        model_name = args.model.split('/')[-1]
-        grd_path = (f"cache_for_guidedq/gradients/"
-                            f"{model_name}-{args.dataset}_s{args.nsamples}_blk{model.seqlen}_g{args.guided_num_groups}")
-        saliency_path = (f"cache_for_guidedq/saliency/"
-                            f"{model_name}-{args.dataset}_s{args.nsamples}_blk{model.seqlen}_g{args.guided_num_groups}")
-                
-        with torch.enable_grad():
-            model_gradients = gradient_utils.get_saliency_gradients(
-                model,
-                dataloader,
-                num_groups=args.guided_num_groups,
-                num_batches=args.nsamples,
-                grd_path=grd_path,
-                saliency_path=saliency_path,
-                dev=dev, args=args
-            )
-
-    error_total = 0
-    count = 0
-    error_store = {}
-    for i in range(len(layers)):
-        if args.method == "guidedq":
-            saliency_dict = torch.load(os.path.join(saliency_path, f"l{i}.pt"))
-            print("Loaded saliency for layer", i)
-
-        layer = layers[i].to(dev)
-        full = find_layers(layer)
-
-        # prepare fp_inputs for this layer (for GPTAQ / GreedyAQ)
-        if args.method in ["gptaq", "greedyaq"]:
-            fp_inputs_cache.add_hook(full)
+    for i in range(n_layers):
+        # If pass2 and layer not selected: just forward to update activations
+        if mode == "requantize" and i not in requantize_layers:
+            layer = layers_s[i].to(dev)
             for j in range(args.nsamples):
-                fp_inps[j] = layer(
-                    fp_inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids, 
-                    position_embeddings=position_embeddings,
-                    cache_position=cache_position,
-                )[0]
-            fp_inputs_cache.clear_hook()
+                outs[j] = layer(inps[j].unsqueeze(0),
+                                attention_mask=attention_mask,
+                                position_embeddings=position_embeddings,
+                                position_ids=position_ids)[0]
+            layers_s[i] = layer.cpu()
+            del layer
+            torch.cuda.empty_cache()
+            inps, outs = outs, inps
+            continue
 
-        print(f'Quantizing layer {i+1}/{len(layers)}..')
+        print(f'Quantizing layer {i+1}/{n_layers}..')
         print('+------------------+--------------+------------+-----------+-------+')
         print('|       name       | weight_error | fp_inp_SNR | q_inp_SNR | time  |')
         print('+==================+==============+============+===========+=======+')
 
-        # ---- first quantization pass (no KD) ----
-        layer_gptq = {}  # keep per-module objects so we can reuse H for 2nd pass
+        # Otherwise: quantize / requantize this layer
+        layer_s = layers_s[i].to(dev)
+        full_s = find_layers(layer_s)
+ 
+        # build teacher fp_inp cache for this layer (only for gptaq/greedyaq)
+        if args.method in ["gptaq", "greedyaq"]:
+            layer_t = layers_t[i].to(dev)
+            full_t = find_layers(layer_t)
+
+            fp_inputs_cache.add_hook(full_t)
+            for j in range(args.nsamples):
+                fp_inps[j] = layer_t(fp_inps[j].unsqueeze(0),
+                                     attention_mask=attention_mask,
+                                     position_embeddings=position_embeddings,
+                                     position_ids=position_ids)[0]
+            fp_inputs_cache.clear_hook()
+
+        # collect Hessian stats on student
+        layer_gptq = {}
 
         for names in sequential:
-            subset_student = {n: full[n] for n in names}
-
+            subset_student = {n: full_s[n] for n in names}
             gptq = {}
+
             for name in subset_student:
-                
-                if args.method == "gptaq":
-                    gptq[name] = GPTAQ(subset_student[name], observe=args.observe)
-                elif args.method == "greedyaq":
+                if args.method == "greedyaq":
                     gptq[name] = GreedyAQ(subset_student[name], observe=args.observe)
-                elif args.method == "foem":
-                    gptq[name] = FOEM(subset_student[name], observe=args.observe)
+                elif args.method == "gptaq":
+                    gptq[name] = GPTAQ(subset_student[name], observe=args.observe)
                 elif args.method == "gptq":
                     gptq[name] = GPTQ(subset_student[name], observe=args.observe)
-                elif args.method == "guidedq":
-                    gptq[name] = GuidedQuant(subset_student[name], saliency=saliency_dict[name], guided_num_groups=args.guided_num_groups)
+                elif args.method == "foem":
+                    gptq[name] = FOEM(subset_student[name], observe=args.observe)
                 else:
                     raise ValueError(f"Method {args.method} not supported.")
 
-                gptq[name].quantizer.configure(
-                    args.wbits, perchannel=True, sym=args.sym, mse=False
-                )
+                gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
                 if args.method in ["gptaq", "greedyaq"]:
                     gptq[name].fp_inp = fp_inputs_cache.fp_cache[name]
 
-            # Collect H and dXXT
             def add_batch(name):
                 def tmp(_, inp, out):
                     gptq[name].add_batch(inp[0].data, out.data)
                 return tmp
 
-            if args.method in ["gptaq", "greedyaq"]:
-                first_module_name = list(subset_student.keys())[0]
-                handle = subset_student[first_module_name].register_forward_hook(
-                    add_batch(first_module_name)
-                )
-            else:
-                handles = []
-                for name in subset_student:
-                    handles.append(subset_student[name].register_forward_hook(add_batch(name)))
+            # share H/dXXT across grouped modules (like your existing code)
+            first_module_name = list(subset_student.keys())[0]
+            handle = subset_student[first_module_name].register_forward_hook(add_batch(first_module_name))
 
             for j in range(args.nsamples):
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    position_embeddings=position_embeddings,
-                    cache_position=cache_position,
-                )[0]
+                outs[j] = layer_s(inps[j].unsqueeze(0),
+                                  attention_mask=attention_mask,
+                                  position_embeddings=position_embeddings,
+                                  position_ids=position_ids)[0]
 
-            if args.method in ["gptaq", "greedyaq"]:
-                handle.remove()
-            else:
-                for h in handles:
-                    h.remove()
+            handle.remove()
 
-            # share H / dXXT for grouped modules
             if args.method in ["gptaq", "greedyaq"]:
                 for name in subset_student:
                     if name != first_module_name:
                         gptq[name].H = gptq[first_module_name].H
                         gptq[name].dXXT = gptq[first_module_name].dXXT
 
-            # first quantization pass (no KD gradient)
+            # quantize (pass1) or requantize with KD grad (pass2)
             for name in subset_student:
+                kd_grad = None
+                if mode == "requantize" and args.method == "greedyaq":
+                    # fetch gradient for this layer/module
+                    kd_grad = kd_gradients[i][name]
+
+                    # IMPORTANT: reload FP teacher weights before re-quantization
+                    # so we quantize the FP weights under KD-augmented objective
+                    gptq[name].layer.weight.data = full_t[name].weight.data.clone().to(dev)
+
                 if args.method == "greedyaq":
-                    # first pass: gradient=None
-                    gradient = gradients[i][name] if (gradients is not None) else None
                     scale, zero, g_idx, error = gptq[name].fasterquant(
                         percdamp=args.percdamp,
                         groupsize=args.groupsize,
@@ -257,24 +259,9 @@ def llama_sequential(model,
                         name=name,
                         alpha=args.alpha,
                         beta=args.beta,
-                        gradient=gradient,  
-                        args=args
+                        gradient=kd_grad,
+                        args=args,
                     )
-                    error_total += error 
-                    count += 1
-                    if i == 0:
-                        error_store[name] = []
-                    else:
-                        error_store[name].append(error)
-                
-                elif args.method == "guidedq":
-                    scale, zero, g_idx, error = gptq[name].fasterquant(
-                        percdamp=args.percdamp,
-                        groupsize=args.groupsize,
-                        actorder=args.act_order,
-                        name=name,
-                        args=args
-                )
                 else:
                     scale, zero, g_idx, error = gptq[name].fasterquant(
                         percdamp=args.percdamp,
@@ -283,62 +270,43 @@ def llama_sequential(model,
                         name=name,
                         alpha=args.alpha,
                         beta=args.beta,
-                        args=args
+                        args=args,
                     )
 
-                if args.method != "guidedq":
-                    quantizers[f'model.layers.{i}.{name}'] = (
-                        gptq[name].quantizer.cpu(),
-                        scale.cpu(), zero.cpu(), g_idx.cpu(),
-                        args.wbits, args.groupsize
-                    )
+                quantizers[f"model.layers.{i}.{name}"] = (
+                    gptq[name].quantizer.cpu(),
+                    scale.cpu(), zero.cpu(), g_idx.cpu(),
+                    args.wbits, args.groupsize
+                )
 
                 if args.observe:
                     observer.submit(name=name, layerid=i, gptq=gptq[name], error=error)
-
-                # keep for potential KD second pass
-                layer_gptq[name] = gptq[name]
-
-            # if not observing AND we are not going to do KD, free immediately
-            if not args.observe and not use_layerwise_kd:
-                for name in subset_student:
+                if not args.observe:
                     gptq[name].free()
 
-        print('+------------------+--------------+------------+-----------+-------+')
-        print('\n')
-
-        # after quantizing this layer, propagate one more time to update inps
+        # update student activations for next layer
         for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                position_embeddings=position_embeddings,
-                cache_position=cache_position,
-            )[0]
+            outs[j] = layer_s(inps[j].unsqueeze(0),
+                              attention_mask=attention_mask,
+                              position_embeddings=position_embeddings,
+                              position_ids=position_ids)[0]
 
         if args.method in ["gptaq", "greedyaq"]:
             fp_inputs_cache.clear_cache()
+            layers_t[i] = layer_t.cpu()
+            del layer_t
 
-        layers[i] = layer.cpu()
-        del layer
+        layers_s[i] = layer_s.cpu()
+        del layer_s
         torch.cuda.empty_cache()
-
         inps, outs = outs, inps
-
-    end_time = time.time()
-    print(f'time cost: {end_time - begin_time}s')
-    print(f'Average weight error: {error_total / count}')
-    out = {}
-    for k, v in error_store.items():
-        out[k] = sum(v) / len(v)
-    print(f'Average Cost per module: {out}')
+        print('+------------------+--------------+------------+-----------+-------+')
+        print('\n')
 
     if args.observe:
         observer.print()
-        # (optional: keep your auto-upgrade logic here if you still want it)
 
-    model.config.use_cache = use_cache
+    student_model.config.use_cache = use_cache
     return quantizers
 
 
@@ -391,6 +359,7 @@ def llama_eval(model, testenc, dev):
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
 
+
     model.model.rotary_emb = model.model.rotary_emb.to(dev)
     bsz, seqlen = position_ids.shape
     cache_position = torch.arange(seqlen, device=dev)
@@ -415,12 +384,9 @@ def llama_eval(model, testenc, dev):
                 subset[name].weight.data = quantizer.quantize(W).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), 
-                            attention_mask=attention_mask, 
-                            position_ids=position_ids,
-                            position_embeddings=position_embeddings,
-                            cache_position=cache_position,
-                            )[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, 
+                            position_embeddings=position_embeddings, 
+                            position_ids=position_ids)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
@@ -666,8 +632,6 @@ if __name__ == '__main__':
     parser.add_argument('--quant-directory', type=str, default=None, help='Specify the directory for export quantization parameters to toml format. `None` means no export by default.')
     parser.add_argument('--step', action='store_true', help='')
     parser.add_argument('--step_bits', type=int, default=8)
-    parser.add_argument('--use_ce_loss', action='store_true', help='Whether to reverse the KD direction.')
-    parser.add_argument('--reverse-kd', action='store_true', help='Whether to reverse the KD direction.')
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
     parser.add_argument('--alpha-method', type=str, default="fixed", choices=["fixed", "sample", "optimize"], help='Coefficient for weight correction term')
@@ -678,7 +642,7 @@ if __name__ == '__main__':
     parser.add_argument('--beta', type=float, default=0.0003, help='Coefficient for weight correction term')
     parser.add_argument('--n_layers_to_update', type=int, default=5, help='Number of layers to update in second quantization.')
     parser.add_argument('--incoh-process', action='store_true', help='Whether to perform incoherence process.')
-    parser.add_argument('--incoh-mode', type=str, default='had', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
+    parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
     parser.add_argument('--rescale-WH', action='store_true', help='Whether to rescale W and H to minimize proxy loss.')
     parser.add_argument('--ours', action='store_true', help='Use our method')
     parser.add_argument('--ours_v2', action='store_true', help='Use our method')
@@ -690,9 +654,6 @@ if __name__ == '__main__':
     parser.add_argument('--first-quant-checkpoint', type=str, default='', help='Path to save/load first quantization checkpoint')
     parser.add_argument('--layers-to-update', type=str, default='sensitive', help='Comma-separated list of layer indices to update in second quantization (e.g., "0,1,2" or "all" or "sensitive" for sensitivity-based selection)')
     parser.add_argument('--sensitivity-threshold', type=float, default=None, help='Sensitivity threshold for selecting layers to update (only used if --layers-to-update=sensitive)')
-    # For GuidedQ
-    parser.add_argument('--guided-num-groups', type=int, default=4, help='Number of groups to use for guided quantization.')
-    # Plotting removed for KD code
 
     args = parser.parse_args()
 
@@ -719,10 +680,6 @@ if __name__ == '__main__':
                 'n_layers_to_update': args.n_layers_to_update,
                 'kd_T': args.kd_T,
                 'kd_beta': args.kd_beta,
-                'reverse_kd': args.reverse_kd, 
-                'guided_num_groups': args.guided_num_groups,
-                'beam_size': args.beam_size,
-                'beam_cands': args.beam_cands
             }
         )
 
@@ -747,31 +704,67 @@ if __name__ == '__main__':
         # # Default to gptq if method not specified
         model = copy.deepcopy(teacher_model)
         model.eval()
+        # build teacher + student
+        teacher_model = get_llama(args.model)
+        teacher_model.eval()
 
-        torch.cuda.synchronize()
+        student_model = copy.deepcopy(teacher_model)
+        student_model.eval()
+
+        dataloader = get_loaders(args.dataset, nsamples=args.nsamples, seed=args.seed,
+                                model=args.model, seqlen=teacher_model.seqlen)
+
+        # -------- PASS 1: regular GreedyAQ quantization (no KD) --------
         tick = time.time()
-        quantizers = llama_sequential(model, dataloader, DEV, fp_path=None, teacher_model=teacher_model, args=args)
+        quantizers = llama_sequential(
+            student_model,
+            dataloader,
+            DEV,
+            teacher_model=teacher_model,   # needed for fp_inp cache (GreedyAQ/GPTAQ)
+            args=args,
+            kd_gradients=None,
+            requantize_layers=None,
+            mode="quantize",
+        )
+        t1 = time.time() - tick
+        print(f"First quantization time: {t1:.2f}s")
+        if args.wandb: wandb.log({"first_quant_time": t1})
 
-        if args.use_ce_loss:
-            # Compute KD gradients for current partially quantized model
+        # -------- Compute KD gradients ONCE: teacher vs quantized student --------
+        use_layerwise_kd = (args.method == "greedyaq" and getattr(args, "kd_beta", 0.0) != 0.0)
+        if use_layerwise_kd:
             with torch.enable_grad():
-                if args.use_ce_loss:
-                    gradients, _ = gradient_utils.get_ce_gradients(
-                        model,
-                        dataloader,
-                        num_batches=args.nsamples,
-                        save_path=None,
-                        dev=DEV, args=args
-                    )
-            quantizers = llama_sequential(model, dataloader, DEV, fp_path=None, teacher_model=teacher_model, gradients=gradients, args=args)
+                kd_gradients, _ = gradient_utils.get_kd_gradients(
+                    teacher_model=teacher_model,
+                    student_model=student_model,
+                    dataloader=dataloader,
+                    num_batches=args.nsamples,
+                    T=getattr(args, "kd_T", 1.0),
+                    dev=DEV,
+                    save_path=None,
+                )
+
+            # choose layers to requantize
+            requant_layers = parse_layers_to_update(args, len(student_model.model.layers))
+            print("Requantize layers:", sorted(list(requant_layers))[:10], "...")
+
+            # -------- PASS 2: requantize selected layers using KD gradients --------
+            tick = time.time()
+            quantizers = llama_sequential(
+                student_model,
+                dataloader,
+                DEV,
+                teacher_model=teacher_model,
+                args=args,
+                kd_gradients=kd_gradients,
+                requantize_layers=requant_layers,
+                mode="requantize",
+            )
+            t2 = time.time() - tick
+            print(f"Second (KD) requantization time: {t2:.2f}s")
+            if args.wandb: wandb.log({"second_quant_time": t2})
+        model = student_model 
         
-        torch.cuda.synchronize()
-        quant_time = time.time() - tick
-        print(f"Quantization time: {quant_time}s")
-        if args.wandb:
-            wandb.log({'quantization_time': quant_time})
-
-
     if args.benchmark:
         gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
         if len(gpus) > 1:

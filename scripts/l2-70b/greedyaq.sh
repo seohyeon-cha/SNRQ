@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
+#SBATCH -t 3:00:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -47,11 +47,11 @@ mkdir -p "${BASE_PLOT_PATH}"
 
 MODEL_PATH="meta-llama/Llama-2-70b-hf"
 ALPHA=0.0
-ALPHA_METHOD="sample"
-MIXUP=5
+ALPHA_METHOD="optimize"
+MIXUP=10.0
 BETA=0.0003
 WBITS_VALUES=(3)
-SEEDS=(2)
+SEEDS=(1 2)
 
 DATE=$(date +"%Y%m%d") 
 
@@ -77,10 +77,10 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --nsamples 128 \
       --eval \
       --mixup-param ${MIXUP} \
-      --save_safetensors saved_quant/l2-70b/greedyaq.safetensors \
+      --save_safetensors saved_quant/l2-70b/greedyaq_seed${seed}.safetensors \
       --wandb \
       --wandb-project L2-70B-symm-new \
-      --wandb-name greedyaq_sample_5_${wbits}bit_seed${seed}"
+      --wandb-name greedyaq_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

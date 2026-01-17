@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -J beam1     # Job name
-#SBATCH -p gh-dev            # Partition (queue) name
+#SBATCH -J greedyaq        # Job name
+#SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 0:30:00     
+#SBATCH -t 2:00:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -42,21 +42,20 @@ PY
 
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 
-MODEL_PATH="meta-llama/Llama-2-13b-hf"
+BASE_PLOT_PATH="plots/alpha/l3-8b/3bits_g128_sample"
+mkdir -p "${BASE_PLOT_PATH}"
+
+MODEL_PATH="meta-llama/Meta-Llama-3-8B"
 
 ALPHA=0.5
 BETA=0.0003
-BETA_KD=1e-3
-N_LAYERS_TO_UPDATE=32
-ALPHA_METHOD="sample"
+ALPHA_METHOD="fixed"
 MIXUP=5.0
-
 WBITS_VALUES=(3)
-SEEDS=(9)
-BEAM=1
+SEEDS=(1 2 3 4)
 
-DATE=$(date +"%Y%m% d")
-mkdir -p logs/l2-13b
+DATE=$(date +"%Y%m%d")
+mkdir -p logs/l3-8b
 mkdir -p slurm_out
 
 for wbits in "${WBITS_VALUES[@]}"; do
@@ -65,9 +64,9 @@ for wbits in "${WBITS_VALUES[@]}"; do
   for seed in "${SEEDS[@]}"; do
     echo "--- Running seed = $seed ---"
     
-    LOG_FILE="/work/10322/scha0901/vista/FOEM/LLM/weight-only/logs/l2-13b/${DATE}_l2-13b-${wbits}bit-128g_greedyaq_seed${seed}.log"
+    LOG_FILE="/work/10322/scha0901/vista/FOEM/LLM/weight-only/logs/l3-8b/${DATE}_l3-8b-${wbits}bit-128g_greedyaq_seed${seed}.log"
     
-    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u /work/10322/scha0901/vista/FOEM/LLM/weight-only/llama_step_kd.py \
+    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u /work/10322/scha0901/vista/FOEM/LLM/weight-only/llama_step.py \
       $MODEL_PATH c4 \
       --method greedyaq \
       --wbits $wbits \
@@ -75,17 +74,15 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --true-sequential \
       --groupsize 128 \
       --seed $seed \
+      --alpha-method ${ALPHA_METHOD} \
       --alpha ${ALPHA} \
-      --nsamples 128 \
+      --mixup-param ${MIXUP} \
       --eval \
       --lm-eval \
-      --beam-size ${BEAM} \
-      --beam-cands 8 \
-      --alpha-method sample \
-      --mixup-param ${MIXUP} \
+      --plot-delta-x-path "${BASE_PLOT_PATH}" \
       --wandb \
-      --wandb-project Beam-Search-Block-1226 \
-      --wandb-name greedyaq_beam${BEAM}_${wbits}bit_seed${seed}"
+      --wandb-project Optimize-Alpha-Incoh \
+      --wandb-name L3-8B_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"
     echo "Log will be saved to: $LOG_FILE"

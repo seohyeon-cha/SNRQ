@@ -3,7 +3,7 @@
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
+#SBATCH -t 4:30:00     
 #SBATCH --output=slurm_out/gptaq_%j.out
 #SBATCH --error=slurm_out/gptaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -46,7 +46,7 @@ ALPHA=0.25
 BETA=0.0003
 
 WBITS_VALUES=(3)
-SEEDS=(0)
+SEEDS=(2 3 4)
 
 DATE=$(date +"%Y%m%d")
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
@@ -73,8 +73,6 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --seed $seed \
       --alpha ${ALPHA} \
       --eval \
-      --lm-eval \
-      --lm-eval-batch-size 1 \
       --wandb \
       --wandb-project L2-70B-symm-new \
       --wandb-name gptaq_${wbits}bit_seed${seed}"

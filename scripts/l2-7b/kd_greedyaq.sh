@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -J greedyaq        # Job name
-#SBATCH -p gh             # Partition (queue) name
+#SBATCH -J beam8        # Job name
+#SBATCH -p gh            # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:30:00     
+#SBATCH -t 1:30:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -52,8 +52,8 @@ ALPHA_METHOD="sample"
 MIXUP=5.0
 
 WBITS_VALUES=(3)
-SEEDS=(0 1 2 3 4)
-BEAM=2
+SEEDS=(5 6 7 8 9)
+BEAM=1
 
 DATE=$(date +"%Y%m% d")
 mkdir -p logs/l2-7b
@@ -76,13 +76,11 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --groupsize 128 \
       --seed $seed \
       --alpha ${ALPHA} \
-      --n_layers_to_update ${N_LAYERS_TO_UPDATE} \
-      --kd-beta ${BETA_KD} \
       --nsamples 128 \
       --eval \
       --lm-eval \
       --beam-size ${BEAM} \
-      --beam-cands 4 \
+      --beam-cands 8 \
       --alpha-method sample \
       --mixup-param ${MIXUP} \
       --wandb \

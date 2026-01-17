@@ -234,13 +234,9 @@ class GreedyAQ:
         beam_cands = int(getattr(args, "beam_cands", 0))
         beam_cands = max(0, beam_cands)
 
-        # Make sure maxq exists
-        if not self.quantizer.ready():
-            self.quantizer.find_params(W_ref, weight=True)
-
         maxq = int(self.quantizer.maxq.item())
         A = maxq + 1
-        codes = torch.arange(A, device=device, dtype=torch.float32)   # for arithmetic
+        codes = torch.arange(A, device=device)   # for arithmetic
 
         # Use float32 for stable scoring
         W_ref_f = W_ref.float()
@@ -248,19 +244,20 @@ class GreedyAQ:
         L_diag_f = L_diag.float()
 
         # Beam scores: start with 1 active beam (beam 0), rest inactive (inf)
-        beam_scores = torch.full((rows, B), float("inf"), device=device, dtype=torch.float32)
+        beam_scores = torch.full((rows, B), float("inf"), device=device)
         beam_scores[:, 0] = 0.0
 
         # We store the already-quantized suffix for each beam as we move left.
         # Q_tail always corresponds to columns [i2:cols] at the start of each block.
-        tail_dtype = torch.float16
+        tail_dtype = torch.float32
         Q_tail = torch.empty((rows, B, 0), device=device, dtype=tail_dtype)  # [rows,B,tail_len]
 
         # For returning packing params
         scale = []
         zero = []
-        seen_groups = set()
-
+        curr_gid = None
+        seen_groups = set() 
+        
         # NOTE: blocksize can be your input blocksize (e.g., 128). Don't overwrite it to cols.
         for i2 in range(cols, 0, -blocksize):
             i1 = max(i2 - blocksize, 0)
@@ -270,27 +267,26 @@ class GreedyAQ:
             # Block data
             W1 = W_ref_f[:, i1:i2]                    # [rows,count]
             Lblk = L_f[i1:i2, i1:i2]                  # [count,count]
-            W1_Lblk = W1 @ Lblk                       # [rows,count]
 
             # Beam-dependent tail correction:
             # tail_corr[b] = (W_ref_tail - Q_tail[b]) @ Ltail
             if tail_len > 0:
                 # W_ref tail for this block is columns [i2:cols]
                 W2 = W_ref_f[:, None, i2:]            # [rows,1,tail_len]
-                E2 = W2 - Q_tail.float()              # [rows,B,tail_len]
+                E2 = W2 - Q_tail             # [rows,B,tail_len]
                 Ltail = L_f[i2:, i1:i2]               # [tail_len,count]
-                tail_corr = torch.matmul(E2, Ltail)   # [rows,B,count]
+                tail_corr = E2 @ Ltail   # [rows,B,count]
             else:
                 tail_corr = torch.zeros((rows, B, count), device=device)
 
             # Beam state for THIS block: quantized values for columns [i1:i2]
-            beam_states = torch.zeros((rows, B, count), device=device)
+            beam_states = torch.zeros((rows, B, count), device=device, dtype=torch.float32)
 
             # Track which old-tail beam each current beam inherits from (so we can reorder Q_tail once per block)
             tail_src = torch.arange(B, device=device, dtype=torch.long).view(1, B).expand(rows, B)  # [rows,B]
 
             # Decode columns in this block from right to left
-            for ii in range(count - 1, -1, -1):
+            for ii in reversed(range(count)):
                 col_abs = i1 + ii
                 Ljj2 = (L_diag_f[col_abs] ** 2)   # scalar tensor
 
@@ -305,24 +301,33 @@ class GreedyAQ:
                         zero.append(self.quantizer.zero)
                         seen_groups.add(group_id)
 
-                sc = self.quantizer.scale.reshape(rows, 1).float()   # [rows,1]
-                ze = self.quantizer.zero.reshape(rows, 1).float()    # [rows,1]
+                sc = self.quantizer.scale.reshape(rows, 1).float()  # [rows,1]
+                ze = self.quantizer.zero.reshape(rows, 1).float()   # [rows,1]
 
                 # What = W1[:,ii] + (W1@v - Qblock@v) + tail_corr[:, :, ii]
                 v = Lblk[:, ii]                       # [count]
-                W1v = W1_Lblk[:, ii]                  # [rows]
-                Qv = torch.matmul(beam_states, v)     # [rows,B]
-                What = W1[:, ii].unsqueeze(1) + (W1v.unsqueeze(1) - Qv) + tail_corr[:, :, ii]  # [rows,B]
+                What = W1[:, ii].unsqueeze(1) + (W1.unsqueeze(1) - beam_states) @ v + tail_corr[:, :, ii]
+
+                # if beam_width == 1:
+                #     q = self.quantizer.quantize(What[:, 0].unsqueeze(1)).flatten()
+                #     beam_states[:, 0, ii] = q
+            
+                #     u = What / sc + ze  
+                #     du = u.unsqueeze(-1) - codes.view(1,1,A) 
+                #     inc = (du * sc.unsqueeze(1)).pow(2) * Ljj2 
+                #     beam_scores = inc 
+                    # continue
 
                 # full alphabet
                 levels = (codes.view(1, A) - ze) * sc          # [rows,A]
                 u = What / sc + ze                             # [rows,B]
                 du = u.unsqueeze(-1) - codes.view(1,1,A)         # [rows,B,A]
                 inc = (du * sc.unsqueeze(1)).pow(2) * Ljj2        # [rows,B,A]
+                # inc = (What.unsqueeze(-1) - levels.unsqueeze(1)).pow(2) * Ljj2  # [rows,B,A]
+                
+                new_scores = beam_scores.unsqueeze(-1) + inc  # [rows,B,A]
 
-                new_scores = beam_scores.unsqueeze(-1) + inc
-                flat = new_scores.reshape(rows, -1)              # [rows,B*A]
-
+                flat = new_scores.reshape(rows, -1)   
                 keep = B
                 topv, topi = torch.topk(flat, k=keep, dim=1, largest=False, sorted=True)
 
@@ -337,6 +342,7 @@ class GreedyAQ:
 
                 q_sel = levels.gather(1, choice)    # [rows,B]
                 beam_states[:, :, ii] = q_sel
+
 
             # ---- End of block: build the new suffix Q_tail = [this block | previous tail] per beam ----
             if tail_len > 0:
@@ -386,7 +392,6 @@ class GreedyAQ:
         # seen_groups = set() 
         # curr_gid = None 
 
-        # blocksize=cols 
         # for i2 in range(cols, 0, -blocksize):
         #     i1 = max(i2 - blocksize, 0)
         #     count = i2 - i1

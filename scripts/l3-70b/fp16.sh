@@ -1,13 +1,14 @@
 #!/bin/bash
-#SBATCH -J ldlq        # Job name
+#SBATCH -J fp16        # Job name
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 1:40:00     
-#SBATCH --output=slurm_out/ldlq_%j.out
-#SBATCH --error=slurm_out/ldlq_%j.err
+#SBATCH -t 0:30:00     
+#SBATCH --output=slurm_out/fp16_%j.out
+#SBATCH --error=slurm_out/fp16_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
 #SBATCH --mail-user=seohyeon.cha@utexas.edu
+
 
 VENV="$WORK/venvs/gptaq"
 source "$VENV/bin/activate"
@@ -40,54 +41,46 @@ print("CUDA available:", torch.cuda.is_available())
 print("exe:", sys.executable)
 PY
 
+MODEL_PATH="meta-llama/Meta-Llama-3-70B"
+
+SEEDS=(0 1 2)
+
+DATE=$(date +"%Y%m%d")
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
+mkdir -p logs/l3-70b
+mkdir -p slurm_out
 
-MODEL_PATH="meta-llama/Meta-Llama-3-8B"
-BETA=0.0003
-WBITS_VALUES=(4)
-SEEDS=(0 1 2 3 4)
+echo "===== Running FP16 (Full Precision) Evaluation ====="
 
-DATE=$(date +"%Y%m%d") 
-
-
-for wbits in "${WBITS_VALUES[@]}"; do
-  echo "===== Testing bitwidth wbits = $wbits ====="
+for seed in "${SEEDS[@]}"; do
+  echo "--- Running seed = $seed ---"
   
-  for seed in "${SEEDS[@]}"; do
-    echo "--- Running seed = $seed ---"
-    
-    LOG_FILE="logs/l3-8b/${DATE}_l3-8b-${wbits}bit-128g_ldlq_seed${seed}.log"
-    
-    CMD="CUDA_VISIBLE_DEVICES=0 $VENV/bin/python -u llama_step.py \
-      $MODEL_PATH c4 \
-      --method ldlq \
-      --sym \
-      --wbits $wbits \
-      --true-sequential \
-      --groupsize 128 \
-      --seed $seed \
-      --nsamples 128 \
+  LOG_FILE="/work/10322/scha0901/vista/FOEM/LLM/weight-only/logs/l3-70b/${DATE}_l3-70b-fp16_seed${seed}.log"
+  
+  # Use SLURM GPU if available, otherwise use GPU 0
+  GPU_ID=${SLURM_LOCALID:-0}
+  CMD="CUDA_VISIBLE_DEVICES=$GPU_ID $VENV/bin/python -u /work/10322/scha0901/vista/FOEM/LLM/weight-only/llama_step.py \
+    $MODEL_PATH c4 \
+    --wbits 16 \
+    --true-sequential \
+    --seed $seed \
       --eval \
       --lm-eval \
       --wandb \
-      --wandb-project L3-8B-symm-new \
-      --wandb-name ldlq_${wbits}bit_seed${seed}"
-    
-    echo "Executing command: $CMD"
-    echo "Log will be saved to: $LOG_FILE"
-    
-    eval "$CMD" | tee "$LOG_FILE"
-    
-    echo "--- Seed $seed evaluation completed ---"
-    echo ""
-    
-    nvidia-smi --gpu-reset 2>/dev/null || true
-    sleep 10
-  done
+      --wandb-project L3-70B-symm-new \
+    --wandb-name fp16_seed${seed}"
   
-  echo "===== All seeds for bitwidth wbits = $wbits completed ====="
+  echo "Executing command: $CMD"
+  echo "Log will be saved to: $LOG_FILE"
+  
+  eval "$CMD" | tee "$LOG_FILE"
+  
+  echo "--- Seed $seed evaluation completed ---"
   echo ""
+  
+  nvidia-smi --gpu-reset 2>/dev/null || true
+  sleep 10
 done
 
-echo "All tests completed!"
+echo "All FP16 evaluations completed!"
 

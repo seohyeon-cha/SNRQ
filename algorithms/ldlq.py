@@ -175,7 +175,8 @@ class LDLQ:
 
         L = torch.linalg.cholesky(Hp)
         Hp_inv = torch.cholesky_inverse(L)
-
+        del Hp 
+        
         Delta_W = None
         if G is not None and beta != 0.0:
             Delta_W = (0.5 * beta * G[:, p]) @ Hp_inv   # [rows, cols]
