@@ -56,9 +56,9 @@ class Observer:
         return self.loss_list
 
 
-class GreedyAQ:
+class SNRQ:
 
-    def __init__(self, layer, observe=False, store_delta_x=False, sampled_alpha=False, mixup_param=0.5, seed=42):
+    def __init__(self, layer, observe=False, sampled_alpha=False, mixup_param=0.5, seed=42):
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
@@ -77,15 +77,15 @@ class GreedyAQ:
         self.quantizer = quant.Quantizer()
         self.observe = observe
         self.inps = []
-        self.store_delta_x = store_delta_x
-        self.delta_x_values = [] if store_delta_x else None  # Store |deltaX| values for plotting
 
         # sampling 
-        self.sampled_alpha = sampled_alpha
-        print(f"GreedyAQ: sampled_alpha={self.sampled_alpha}, mixup_param={mixup_param}")
-        self.mixup_param = mixup_param
-        self.seed = seed
         torch.manual_seed(self.seed)
+        self.sampled_alpha = sampled_alpha
+        self.mixup_param = mixup_param
+        if self.sampled_alpha:
+            self.beta_dist = self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
+        self.seed = seed
+        
 
     def add_batch(self, inp, out):
         if self.observe:
@@ -106,26 +106,20 @@ class GreedyAQ:
 
         self.H *= self.nsamples / (self.nsamples + tmp)
         self.dXXT *= self.nsamples / (self.nsamples + tmp)
-        # self.dXdXT *= self.nsamples / (self.nsamples + tmp)
+
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
         dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
-        # I'll sample alpha here - from Beta distribution (to use different sampled alpha for different calibration sample)
+
+        # sample alpha
         if self.sampled_alpha:
-            self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
-            alpha = self._beta_dist.sample().item()
+            alpha = self.beta_dist.sample().item()
             alpha = min(alpha, 1-alpha)
             dX = dX * alpha
         self.dXXT += dX.matmul(inp.t())
 
-        # self.dXdXT += dX.matmul(dX.t())
-        
-        # Store |deltaX| for plotting only if enabled: shape is [channels, samples]
-        if self.store_delta_x:
-            abs_dX = torch.abs(dX)  # |deltaX| per channel
-            self.delta_x_values.append(abs_dX.cpu().clone())
-        
+
         del self.fp_inp[0]
 
     def print_loss(self, name, q_weight, alpha, timecost):

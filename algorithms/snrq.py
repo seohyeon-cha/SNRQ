@@ -57,9 +57,9 @@ class Observer:
         return self.loss_list
 
 
-class GreedyAQ:
+class SNRQ:
 
-    def __init__(self, layer, observe=False, store_delta_x=False, sampled_alpha=False, mixup_param=0.5, seed=42):
+    def __init__(self, layer, observe=False, sampled_alpha=False, mixup_param=0.5, seed=42):
         self.layer = layer
         self.dev = self.layer.weight.device
         W = layer.weight.data.clone()
@@ -78,16 +78,15 @@ class GreedyAQ:
         self.quantizer = quant.Quantizer()
         self.observe = observe
         self.inps = []
-        self.store_delta_x = store_delta_x
-        self.delta_x_values = [] if store_delta_x else None  # Store |deltaX| values for plotting
 
         # sampling 
+        torch.manual_seed(self.seed)
         self.sampled_alpha = sampled_alpha
         self.mixup_param = mixup_param
         if self.sampled_alpha:
             self.beta_dist = self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
         self.seed = seed
-        torch.manual_seed(self.seed)
+        
 
     def add_batch(self, inp, out):
         if self.observe:
@@ -119,11 +118,6 @@ class GreedyAQ:
             alpha = min(alpha, 1-alpha)
             dX = dX * alpha
         self.dXXT += dX.matmul(inp.t())
-        
-        # Store |deltaX| for plotting only if enabled: shape is [channels, samples]
-        if self.store_delta_x:
-            abs_dX = torch.abs(dX)  # |deltaX| per channel
-            self.delta_x_values.append(abs_dX.cpu().clone())
         
         dX = None 
         inp = None 

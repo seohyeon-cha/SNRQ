@@ -20,8 +20,7 @@ import copy
 import transformers
 from algorithms.gptq import GPTQ
 from algorithms.gptaq import GPTAQ
-from algorithms.greedyaq import GreedyAQ
-from algorithms.foem import FOEM
+from algorithms.snrq import SNRQ
 from algorithms.ldlq import LDLQ
 from algorithms.guidedquant import GuidedQuant
 from algorithms.gptq import Observer  # Observer is the same across all algorithms
@@ -109,7 +108,7 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
         ['mlp.down_proj']
     ]
 
-    if args.method in ["gptaq", "greedyaq"]:
+    if args.method in ["gptaq", "snrq"]:
         fp_inputs_cache = utils.modelutils.FPInputsCache(sequential)
         fp_inps = inps.clone()
 
@@ -126,7 +125,7 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
         layer = layers[i].to(dev)
         full = find_layers(layer)
 
-        if args.method in ["gptaq", "greedyaq"]:
+        if args.method in ["gptaq", "snrq"]:
             fp_inputs_cache.add_hook(full)
 
             for j in range(args.nsamples):
@@ -141,14 +140,12 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
             for name in subset:
                 if args.method == "gptaq":
                     gptq[name] = GPTAQ(subset[name], observe=args.observe)
-                elif args.method == "greedyaq":
+                elif args.method == "snrq":
                     if args.alpha_method == "sample":
-                        gptq[name] = GreedyAQ(subset[name], observe=args.observe,
+                        gptq[name] = SNRQ(subset[name], observe=args.observe,
                                               sampled_alpha=True, mixup_param=args.mixup_param, seed=args.seed)
                     else:
-                        gptq[name] = GreedyAQ(subset[name], observe=args.observe)
-                elif args.method == "foem":
-                    gptq[name] = FOEM(subset[name], observe=args.observe)
+                        gptq[name] = SNRQ(subset[name], observe=args.observe)
                 elif args.method == "gptq":
                     gptq[name] = GPTQ(subset[name], observe=args.observe)
                 elif args.method == "ldlq":
@@ -160,8 +157,8 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
                 else:
                     raise ValueError(f"Method {args.method} not supported.")
                 gptq[name].quantizer.configure(args.wbits, perchannel=True, sym=args.sym, mse=False)
-                # Only GPTAQ and GreedyAQ need fp_inp
-                if args.method in ["gptaq", "greedyaq"]:
+                # Only GPTAQ and SNRQ need fp_inp
+                if args.method in ["gptaq", "snrq"]:
                     gptq[name].fp_inp = fp_inputs_cache.fp_cache[name]
 
             def add_batch(name):
@@ -182,14 +179,14 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
                 if name != first_module_name:
                     # All methods share Hessian H across modules in the same sequential group
                     gptq[name].H = gptq[first_module_name].H
-                    if args.method in ["gptaq", "greedyaq"]:
+                    if args.method in ["gptaq", "snrq"]:
                         gptq[name].dXXT = gptq[first_module_name].dXXT
                         if hasattr(gptq[first_module_name], 'dXdXT'):
                             gptq[name].dXdXT = gptq[first_module_name].dXdXT
 
             for name in subset:
-                # GreedyAQ requires args parameter, others don't need it
-                if args.method == "greedyaq":
+                # SNRQ requires args parameter, others don't need it
+                if args.method == "snrq":
                     if args.alpha_method == "optimize":
                         if i == 0:
                             args.alpha_per_module[name] = [0.0]
@@ -229,7 +226,7 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids, position_embeddings=position_embeddings)[0]
 
-        if getattr(args, 'plot_delta_x', False) and args.method in ["gptaq", "greedyaq"]:
+        if getattr(args, 'plot_delta_x', False) and args.method in ["gptaq", "snrq"]:
             # X_f = fp_inps, X_q = outs
             dx_block = fp_inps - outs  # [nsamples, seqlen, hidden_size]
 
@@ -252,7 +249,7 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
             mae_per_channel = dx_block_reshaped.abs().mean(dim=1).cpu()  # [hidden_size]
             transformer_block_dx.append(mae_per_channel)
 
-        if args.method in ["gptaq", "greedyaq"]:
+        if args.method in ["gptaq", "snrq"]:
             fp_inputs_cache.clear_cache()
 
         layers[i] = layer.cpu()
@@ -364,8 +361,8 @@ def qwen3_sequential(model, dataloader, dev, fp_path):
 
                 gptq.quantizer.configure(wbits, perchannel=True, sym=args.sym, mse=False)
 
-                # GreedyAQ requires args parameter, others don't need it
-                if args.method == "greedyaq":
+                # SNRQ requires args parameter, others don't need it
+                if args.method == "snrq":
                     scale, zero, g_idx, error = gptq.fasterquant(percdamp=args.percdamp, groupsize=groupsize,
                                                                  actorder=args.act_order, name=name, alpha=args.alpha,
                                                                  beta=args.beta, args=args)
@@ -829,11 +826,11 @@ if __name__ == '__main__':
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--sort-asym', action='store_true', help='Whether to sort asymmetric quantization levels.')
     parser.add_argument('--alpha-method', type=str, default='fixed', choices=['fixed', 'alternate', 'sample', 'optimize'], help='Method to use for alpha update.')
-    parser.add_argument('--mixup-param', type=float, default=0.0, help='Mixup parameter for GreedyAQ.')
+    parser.add_argument('--mixup-param', type=float, default=0.0, help='Mixup parameter for SNRQ.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
     parser.add_argument('--beta', type=float, default=0.0003, help='Coefficient for weight correction term')
     parser.add_argument('--incoh-process', action='store_true', help='Whether to perform incoherence process.')
-    parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'], help='Incoherence mode for GreedyAQ.')
+    parser.add_argument('--incoh-mode', type=str, default='kron', choices=['had', 'kron'], help='Incoherence mode for SNRQ.')
     parser.add_argument('--rescale-WH', action='store_true', help='Whether to rescale W and H to minimize proxy loss.')
     parser.add_argument('--rescale-D', action='store_true', help='Whether to rescale W and H to minimize proxy loss.')
     parser.add_argument('--plot-delta-x', action='store_true', help='Whether to plot delta X values and generate 3D plots of |X_q - X_f|')
