@@ -172,22 +172,23 @@ class LDLQ:
         p = torch.argsort(torch.diag(Hr), descending=False) # sort based on column of X_t 
         P = torch.eye(Hr.shape[0], device=Hr.device)[:, p]
         Hp = Hr[p][:, p]
-
+        del Hr 
         L = torch.linalg.cholesky(Hp)
-        Hp_inv = torch.cholesky_inverse(L)
         del Hp 
+        Hp_inv = torch.cholesky_inverse(L)
         
         Delta_W = None
         if G is not None and beta != 0.0:
             Delta_W = (0.5 * beta * G[:, p]) @ Hp_inv   # [rows, cols]
-        
+        del Hp_inv
+
         L_diag = torch.diag(L)
         L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
         L = L - torch.eye(L.shape[0], device=L.device)
         del L_diag
 
         Wr = Wr[:, p] 
-        del Hp_inv
+        
 
         if Delta_W is not None:
             Wr = Wr - Delta_W
@@ -200,15 +201,25 @@ class LDLQ:
         scale = []
         zero = []
         seen_groups = set()  # Track which groups we've already saved
-        
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt   = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+
         for i2 in range(self.columns, 0, -blocksize):
             i1 = max(i2 - blocksize, 0)
             count = i2 - i1
+            
             W1 = Wr[:, i1:i2].clone()
             W2diff = Wr[:, i2:] - Q[:, i2:]
             What1 = Q[:, i1:i2].clone()
             L1 = L[:, i1:i2]
-            
+            tail_corr = W2diff @ L1[i2:, :]    
+
             for i in reversed(range(count)):
                 if groupsize != -1:
                     gstart = (i1 + i) // groupsize * groupsize
@@ -221,17 +232,29 @@ class LDLQ:
                         zero.append(self.quantizer.zero)
                         seen_groups.add(group_id)
 
-                What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + W2diff @ L1[i2:,i]
+                What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + tail_corr[:, i]
                 What1[:, i] = self.quantizer.quantize(What.unsqueeze(1)).flatten()
             Q[:, i1:i2] = What1
 
+        end_evt.record()
+        torch.cuda.synchronize()
+        rounding_ms = start_evt.elapsed_time(end_evt)  # milliseconds
 
+        peak_mem_bytes = torch.cuda.max_memory_allocated()
+        peak_mem_gb = peak_mem_bytes / (1024**3)
+
+        # Store metrics as instance attributes for logging
+        self.rounding_ms = rounding_ms
+        self.peak_mem_gb = peak_mem_gb
+        
         Q = Q @ P.t().to(Q.device)
         
         if args.incoh_process:
             Q = incoherence_process(Q, SU, SV, scaleWH, args)
         torch.cuda.synchronize()
         error = torch.trace((W - Q) @ H @ (W - Q).t())
+
+        del L, W, P, Wr
 
         groupsize = groupsize if groupsize != -1 else self.columns
         g_idx = [i // groupsize for i in range(self.columns)]

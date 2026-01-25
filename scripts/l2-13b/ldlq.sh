@@ -44,7 +44,7 @@ cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 
 MODEL_PATH="meta-llama/Llama-2-13b-hf"
 BETA=0.0003
-WBITS_VALUES=(4)
+WBITS_VALUES=(2)
 SEEDS=(0 1 2 3 4)
 
 DATE=$(date +"%Y%m%d") 
@@ -68,9 +68,8 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --seed $seed \
       --nsamples 128 \
       --eval \
-      --lm-eval \
       --wandb \
-      --wandb-project L2-13B-symm-new \
+      --wandb-project Beam-Search-Bug-Fix-Vista \
       --wandb-name ldlq_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"

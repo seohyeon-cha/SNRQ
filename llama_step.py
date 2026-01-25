@@ -83,8 +83,6 @@ def llama_sequential(model, dataloader, dev, fp_path):
 
     outs = torch.zeros_like(inps)
 
-    inps_ = inps.data.clone()
-    outs_ = outs.data.clone()
 
     attention_mask = cache['attention_mask']
     position_ids = cache['position_ids']
@@ -123,6 +121,10 @@ def llama_sequential(model, dataloader, dev, fp_path):
 
     args.alpha_track = []
     args.alpha_per_module = {}
+
+    # Track per-module metrics across layers for wandb logging
+    module_rounding_ms = {}  # module_name -> list of rounding times (ms) per layer
+    module_peak_mem_gb = {}  # module_name -> list of peak memory (GB) per layer
 
     for i in range(len(layers)):
 
@@ -212,7 +214,7 @@ def llama_sequential(model, dataloader, dev, fp_path):
                         if i == 0:
                             args.alpha_per_module[name] = [0.0]
                         if i == 1:
-                            if args.groupsize == -1 or args.model == "meta-llama/Llama-2-70b-hf":
+                            if args.groupsize == -1 or "70" in args.model:
                                 alpha_ref = 0.25
                             else:
                                 alpha_ref = 0.5 
@@ -228,11 +230,19 @@ def llama_sequential(model, dataloader, dev, fp_path):
                     scale, zero, g_idx, error = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order, name=name, alpha=args.alpha, beta=args.beta, args=args)
                 quantizers['model.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(), scale.cpu(), zero.cpu(), g_idx.cpu(), args.wbits, args.groupsize)
 
+                # Collect rounding_ms and peak_mem_gb if available (for greedyaq)
+                if hasattr(gptq[name], 'rounding_ms') and hasattr(gptq[name], 'peak_mem_gb'):
+                    if name not in module_rounding_ms:
+                        module_rounding_ms[name] = []
+                    if name not in module_peak_mem_gb:
+                        module_peak_mem_gb[name] = []
+                    module_rounding_ms[name].append(gptq[name].rounding_ms)
+                    module_peak_mem_gb[name].append(gptq[name].peak_mem_gb)
+
                 if args.observe:
                     observer.submit(name=name, layerid=i, gptq=gptq[name], error=error)
                 else:
                     gptq[name].free()
-
 
         for j in range(args.nsamples):
             outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids,
@@ -268,18 +278,52 @@ def llama_sequential(model, dataloader, dev, fp_path):
         
         layers[i] = layer.cpu()
         del layer
-        del gptq
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
-        inps_, outs_ = outs_, inps_
+
         print('+------------------+--------------+------------+-----------+-------+')
         print('\n')
 
     end_time = time.time()
 
     print(f'time cost: {end_time-begin_time}s')
+
+    # Compute and log per-module averages for rounding time and peak memory
+    if args.wandb and (module_rounding_ms or module_peak_mem_gb):
+        wandb_metrics = {}
+        per_module_avg_rounding_ms = {}
+        per_module_avg_peak_mem_gb = {}
+        
+        for module_name in module_rounding_ms:
+            if module_rounding_ms[module_name]:
+                avg_rounding_ms = sum(module_rounding_ms[module_name]) / len(module_rounding_ms[module_name])
+                per_module_avg_rounding_ms[module_name] = avg_rounding_ms
+                wandb_metrics[f'avg_rounding_ms/{module_name}'] = avg_rounding_ms
+                print(f'Average rounding time for {module_name}: {avg_rounding_ms:.2f}ms')
+        
+        for module_name in module_peak_mem_gb:
+            if module_peak_mem_gb[module_name]:
+                avg_peak_mem_gb = sum(module_peak_mem_gb[module_name]) / len(module_peak_mem_gb[module_name])
+                per_module_avg_peak_mem_gb[module_name] = avg_peak_mem_gb
+                wandb_metrics[f'avg_peak_mem_gb/{module_name}'] = avg_peak_mem_gb
+                print(f'Average peak memory for {module_name}: {avg_peak_mem_gb:.2f}GB')
+        
+        # Compute overall averages across all modules
+        if per_module_avg_rounding_ms:
+            overall_avg_rounding_ms = sum(per_module_avg_rounding_ms.values()) / len(per_module_avg_rounding_ms)
+            wandb_metrics['avg_rounding_ms/overall'] = overall_avg_rounding_ms
+            print(f'Overall average rounding time across all modules: {overall_avg_rounding_ms:.2f}ms')
+        
+        if per_module_avg_peak_mem_gb:
+            overall_avg_peak_mem_gb = sum(per_module_avg_peak_mem_gb.values()) / len(per_module_avg_peak_mem_gb)
+            wandb_metrics['avg_peak_mem_gb/overall'] = overall_avg_peak_mem_gb
+            print(f'Overall average peak memory across all modules: {overall_avg_peak_mem_gb:.2f}GB')
+        
+        if wandb_metrics:
+            wandb.log(wandb_metrics)
     
+
     # Plot transformer block output dX if enabled
     if getattr(args, 'plot_delta_x', False) and len(transformer_block_dx) > 0:
         plot_path_2d = f"{args.plot_delta_x_path}/transformer_block_dx_2d_{args.method}.png"
@@ -903,6 +947,7 @@ if __name__ == '__main__':
                 'beam_cands': args.beam_cands, 
                 'nn_beam': args.nn_beam,
                 'cd_passes': args.cd_passes,
+                'nsamples': args.nsamples, 
 
             }
         )

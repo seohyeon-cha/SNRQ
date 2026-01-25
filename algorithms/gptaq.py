@@ -98,9 +98,11 @@ class GPTAQ:
         self.nsamples += tmp
         inp = math.sqrt(2 / self.nsamples) * inp.float()
         self.H += inp.matmul(inp.t())
+
         dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
         self.dXXT += dX.matmul(inp.t())
-        
+
+
         # Store |deltaX| for plotting only if enabled: shape is [channels, samples]
         if self.store_delta_x:
             abs_dX = torch.abs(dX)  # |deltaX| per channel
@@ -200,6 +202,15 @@ class GPTAQ:
         P = alpha * ((Dr @ Hinv.T).triu(diagonal=1)) @ Hinv
         del self.dXXT, Dr
 
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt   = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+
+
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
             count = i2 - i1
@@ -240,7 +251,18 @@ class GPTAQ:
 
             Wr[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:]) - W1.matmul(P[i1:i2, i2:])
 
+
+        end_evt.record()
         torch.cuda.synchronize()
+        rounding_ms = start_evt.elapsed_time(end_evt)  # milliseconds
+
+        peak_mem_bytes = torch.cuda.max_memory_allocated()
+        peak_mem_gb = peak_mem_bytes / (1024**3)
+
+        # Store metrics as instance attributes for logging
+        self.rounding_ms = rounding_ms
+        self.peak_mem_gb = peak_mem_gb
+
         error = torch.sum(Losses).item()
 
         groupsize = groupsize if groupsize != -1 else self.columns

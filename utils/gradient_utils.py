@@ -405,8 +405,8 @@ def get_kd_gradients(
 
     # Hook: square the gradient before it is stored in .grad
     def grad_hook(grad):
-        return grad
-
+        return grad.pow(2)
+    
     hooks = []
 
     sequential = [

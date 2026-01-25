@@ -1,9 +1,9 @@
 #!/bin/bash
-#SBATCH -J greedyaq        # Job name
+#SBATCH -J 8b        # Job name
 #SBATCH -p gh             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
+#SBATCH -t 1:30:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -47,9 +47,9 @@ mkdir -p "${BASE_PLOT_PATH}"
 
 MODEL_PATH="meta-llama/Meta-Llama-3-8B"
 
-ALPHA=0.5
+ALPHA=0.376953125
 BETA=0.0003
-ALPHA_METHOD="optimize"
+ALPHA_METHOD="fixed"
 MIXUP=5.0
 WBITS_VALUES=(3)
 SEEDS=(0 1 2 3 4)
@@ -76,12 +76,13 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --seed $seed \
       --alpha-method ${ALPHA_METHOD} \
       --alpha ${ALPHA} \
+      --nsamples 32 \
       --mixup-param ${MIXUP} \
       --eval \
       --lm-eval \
       --beam-size 1 \
       --wandb \
-      --wandb-project Quant-time-optimize \
+      --wandb-project Alpha-Stochastic-Test \
       --wandb-name L3-8B_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"

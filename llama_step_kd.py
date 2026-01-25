@@ -153,6 +153,13 @@ def llama_sequential(model,
     error_total = 0
     count = 0
     error_store = {}
+
+        
+    # Track per-module metrics across layers for wandb logging
+    module_rounding_ms = {}  # module_name -> list of rounding times (ms) per layer
+    module_peak_mem_gb = {}  # module_name -> list of peak memory (GB) per layer
+    
+    
     for i in range(len(layers)):
         if args.method == "guidedq":
             saliency_dict = torch.load(os.path.join(saliency_path, f"l{i}.pt"))
@@ -191,7 +198,11 @@ def llama_sequential(model,
                 if args.method == "gptaq":
                     gptq[name] = GPTAQ(subset_student[name], observe=args.observe)
                 elif args.method == "greedyaq":
-                    gptq[name] = GreedyAQ(subset_student[name], observe=args.observe)
+                    if args.alpha_method == "sample":
+                        gptq[name] = GreedyAQ(subset_student[name], observe=args.observe, 
+                                              sampled_alpha=True, mixup_param=args.mixup_param, seed=args.seed)
+                    else:
+                        gptq[name] = GreedyAQ(subset_student[name], observe=args.observe)
                 elif args.method == "foem":
                     gptq[name] = FOEM(subset_student[name], observe=args.observe)
                 elif args.method == "gptq":
@@ -245,6 +256,7 @@ def llama_sequential(model,
                         gptq[name].H = gptq[first_module_name].H
                         gptq[name].dXXT = gptq[first_module_name].dXXT
 
+
             # first quantization pass (no KD gradient)
             for name in subset_student:
                 if args.method == "greedyaq":
@@ -293,6 +305,16 @@ def llama_sequential(model,
                         args.wbits, args.groupsize
                     )
 
+                # Collect rounding_ms and peak_mem_gb if available (for greedyaq)
+                if args.method == "greedyaq" and hasattr(gptq[name], 'rounding_ms') and hasattr(gptq[name], 'peak_mem_gb'):
+                    if name not in module_rounding_ms:
+                        module_rounding_ms[name] = []
+                    if name not in module_peak_mem_gb:
+                        module_peak_mem_gb[name] = []
+                    module_rounding_ms[name].append(gptq[name].rounding_ms)
+                    module_peak_mem_gb[name].append(gptq[name].peak_mem_gb)
+
+
                 if args.observe:
                     observer.submit(name=name, layerid=i, gptq=gptq[name], error=error)
 
@@ -333,6 +355,41 @@ def llama_sequential(model,
     for k, v in error_store.items():
         out[k] = sum(v) / len(v)
     print(f'Average Cost per module: {out}')
+
+    # Compute and log per-module averages for rounding time and peak memory
+    if args.wandb and (module_rounding_ms or module_peak_mem_gb):
+        wandb_metrics = {}
+        per_module_avg_rounding_ms = {}
+        per_module_avg_peak_mem_gb = {}
+        
+        for module_name in module_rounding_ms:
+            if module_rounding_ms[module_name]:
+                avg_rounding_ms = sum(module_rounding_ms[module_name]) / len(module_rounding_ms[module_name])
+                per_module_avg_rounding_ms[module_name] = avg_rounding_ms
+                wandb_metrics[f'avg_rounding_ms/{module_name}'] = avg_rounding_ms
+                print(f'Average rounding time for {module_name}: {avg_rounding_ms:.2f}ms')
+        
+        for module_name in module_peak_mem_gb:
+            if module_peak_mem_gb[module_name]:
+                avg_peak_mem_gb = sum(module_peak_mem_gb[module_name]) / len(module_peak_mem_gb[module_name])
+                per_module_avg_peak_mem_gb[module_name] = avg_peak_mem_gb
+                wandb_metrics[f'avg_peak_mem_gb/{module_name}'] = avg_peak_mem_gb
+                print(f'Average peak memory for {module_name}: {avg_peak_mem_gb:.2f}GB')
+        
+        # Compute overall averages across all modules
+        if per_module_avg_rounding_ms:
+            overall_avg_rounding_ms = sum(per_module_avg_rounding_ms.values()) / len(per_module_avg_rounding_ms)
+            wandb_metrics['avg_rounding_ms/overall'] = overall_avg_rounding_ms
+            print(f'Overall average rounding time across all modules: {overall_avg_rounding_ms:.2f}ms')
+        
+        if per_module_avg_peak_mem_gb:
+            overall_avg_peak_mem_gb = sum(per_module_avg_peak_mem_gb.values()) / len(per_module_avg_peak_mem_gb)
+            wandb_metrics['avg_peak_mem_gb/overall'] = overall_avg_peak_mem_gb
+            print(f'Overall average peak memory across all modules: {overall_avg_peak_mem_gb:.2f}GB')
+        
+        if wandb_metrics:
+            wandb.log(wandb_metrics)
+    
 
     if args.observe:
         observer.print()
@@ -670,8 +727,10 @@ if __name__ == '__main__':
     parser.add_argument('--reverse-kd', action='store_true', help='Whether to reverse the KD direction.')
     parser.add_argument('--method', type=str, default='', help='Method to use for quantization.')
     parser.add_argument('--alpha', type=float, default=0.25, help='Coefficient for weight correction term')
-    parser.add_argument('--alpha-method', type=str, default="fixed", choices=["fixed", "sample", "optimize"], help='Coefficient for weight correction term')
+    parser.add_argument('--alpha-method', type=str, default="sample", choices=["fixed", "sample", "optimize"], help='Coefficient for weight correction term')
     parser.add_argument('--mixup-param', type=float, default=5.0, help='Coefficient for weight correction term')
+    parser.add_argument('--cd_passes', type=int, default=0, help='Number of coordinate descent passes for GreedyAQ.')
+    # for beam search
     parser.add_argument('--beam-size', type=int, default=1, help='Coefficient for weight correction term')
     parser.add_argument('--beam-cands', type=int, default=128, help='Coefficient for weight correction term')
 
@@ -722,7 +781,8 @@ if __name__ == '__main__':
                 'reverse_kd': args.reverse_kd, 
                 'guided_num_groups': args.guided_num_groups,
                 'beam_size': args.beam_size,
-                'beam_cands': args.beam_cands
+                'beam_cands': args.beam_cands,
+                'cd_passes': args.cd_passes, 
             }
         )
 

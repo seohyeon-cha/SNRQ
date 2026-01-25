@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J greedyaq        # Job name
-#SBATCH -p gh             # Partition (queue) name
+#SBATCH -p gh-dev             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 2:00:00     
+#SBATCH -t 0:30:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -78,10 +78,11 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --beam-size 1 \
       --mixup-param ${MIXUP} \
       --kd-T 1.0 \
-      --kd-beta 1e-4 \
+      --kd-beta 1e-3 \
       --n_layers_to_update 10 \
       --lm-eval \
       --eval \
+      --wandb \
       --wandb-project KD-Test \
       --wandb-name L2-7B-${wbits}bit_seed${seed}" \
     

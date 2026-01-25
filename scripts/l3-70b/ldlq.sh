@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J ldlq        # Job name
-#SBATCH -p gh             # Partition (queue) name
+#SBATCH -p gh-dev             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 5:00:00     
+#SBATCH -t 1:30:00     
 #SBATCH --output=slurm_out/ldlq_%j.out
 #SBATCH --error=slurm_out/ldlq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -45,7 +45,7 @@ cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
 MODEL_PATH="meta-llama/Meta-Llama-3-70B"
 BETA=0.0003
 WBITS_VALUES=(3)
-SEEDS=(0 1 2)
+SEEDS=(0)
 
 DATE=$(date +"%Y%m%d") 
 
@@ -68,7 +68,6 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --seed $seed \
       --nsamples 128 \
       --eval \
-      --lm-eval \
       --wandb \
       --wandb-project L3-70B-symm-new \
       --wandb-name ldlq_${wbits}bit_seed${seed}"

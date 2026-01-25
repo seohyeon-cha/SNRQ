@@ -82,6 +82,7 @@ class GreedyAQ:
 
         # sampling 
         self.sampled_alpha = sampled_alpha
+        print(f"GreedyAQ: sampled_alpha={self.sampled_alpha}, mixup_param={mixup_param}")
         self.mixup_param = mixup_param
         self.seed = seed
         torch.manual_seed(self.seed)
@@ -257,7 +258,15 @@ class GreedyAQ:
         zero = []
         curr_gid = None
         seen_groups = set() 
-        
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt   = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+
         # NOTE: blocksize can be your input blocksize (e.g., 128). Don't overwrite it to cols.
         for i2 in range(cols, 0, -blocksize):
             i1 = max(i2 - blocksize, 0)
@@ -308,16 +317,6 @@ class GreedyAQ:
                 v = Lblk[:, ii]                       # [count]
                 What = W1[:, ii].unsqueeze(1) + (W1.unsqueeze(1) - beam_states) @ v + tail_corr[:, :, ii]
 
-                # if beam_width == 1:
-                #     q = self.quantizer.quantize(What[:, 0].unsqueeze(1)).flatten()
-                #     beam_states[:, 0, ii] = q
-            
-                #     u = What / sc + ze  
-                #     du = u.unsqueeze(-1) - codes.view(1,1,A) 
-                #     inc = (du * sc.unsqueeze(1)).pow(2) * Ljj2 
-                #     beam_scores = inc 
-                    # continue
-
                 # full alphabet
                 levels = (codes.view(1, A) - ze) * sc          # [rows,A]
                 u = What / sc + ze                             # [rows,B]
@@ -358,128 +357,112 @@ class GreedyAQ:
         Qp = Q_tail[torch.arange(rows, device=device), best, :].to(W_ref.dtype)  # [rows,cols]
         obj_total = float(beam_scores.min(dim=1).values.sum().item())
 
+        cd_passes = int(getattr(args, "cd_passes", 0))
+        if cd_passes > 0:
+            with torch.no_grad():
+                # IMPORTANT:
+                # At this point, Q and W_ref are in the SAME (possibly p_asym) order,
+                # and Hp is the Hessian in that same order. So we do CD here.
+                H_cd = Hp
+                H_cd = H_cd / H_cd.diag().max().clamp(min=1e-8)  # scale-invariant stabilization
+
+                cols = self.columns
+                gs = cols if groupsize == -1 else groupsize
+
+                # residual in the LDLQ space
+                # (matches your snippet's s = w_hat - w)
+                s = Qp - W_ref
+
+                for igp in range(cd_passes):
+                    any_change = False
+                    curr_gid = None
+
+                    for i2 in range(cols, 0, -blocksize):
+                        i1 = max(i2 - blocksize, 0)
+                        count = i2 - i1
+
+                        # local block copies
+                        W1 = Qp[:, i1:i2].clone()
+                        S0 = s[:, :i1]                # view
+                        S1 = s[:, i1:i2].clone()
+                        S2 = s[:, i2:]                # view
+
+                        # Hessian block slices
+                        H0 = H_cd[:i1,  i1:i2]         # [i1, count]
+                        H1 = H_cd[i1:i2, i1:i2]        # [count, count]
+                        H2 = H_cd[i2:,  i1:i2]         # [cols-i2, count]
+
+                        # Precompute contribution from outside this block ONCE:
+                        # Hs_pre[:, j] = S0@H0[:,j] + S2@H2[:,j]
+                        Hs_pre = torch.zeros(
+                            (Qp.shape[0], count), device=Qp.device, dtype=Qp.dtype
+                        )
+                        if i1 > 0:
+                            Hs_pre += S0 @ H0
+                        if i2 < cols:
+                            Hs_pre += S2 @ H2
+
+                        # Maintain S1 @ H1 incrementally (faster than recomputing each coord)
+                        S1H1 = S1 @ H1  # [rows, count]
+
+                        for ii in reversed(range(count)):
+                            col_abs = i1 + ii
+
+                            # Load quant params per group (same grouping rule as your greedy loop)
+                            if groupsize != -1:
+                                gid = col_abs // gs
+                                if gid != curr_gid:
+                                    curr_gid = gid
+                                    gstart = gid * gs
+                                    gend = min(gstart + gs, cols)
+                                    self.quantizer.find_params(W_ref[:, gstart:gend], weight=True)
+
+                            denom = H1[ii, ii].clamp(min=1e-8)
+
+                            # Hs = S0@H0[:,ii] + S1@H1[:,ii] + S2@H2[:,ii]
+                            # but we use:
+                            #   Hs_pre[:,ii] = S0@H0[:,ii] + S2@H2[:,ii]
+                            #   S1H1[:,ii]   = S1@H1[:,ii]
+                            Hs = Hs_pre[:, ii] + S1H1[:, ii]
+
+                            # Coordinate update + projection to quant grid
+                            proposal = W1[:, ii] - (Hs / denom)
+                            q_new = self.quantizer.quantize(proposal.unsqueeze(1)).flatten()
+
+                            eps = W1[:, ii] - q_new
+                            if torch.any(eps != 0):
+                                any_change = True
+
+                            # apply update (matches your snippet's W1 -= eps, S1 -= eps)
+                            W1[:, ii] = q_new
+                            S1[:, ii] -= eps
+
+                            # keep S1H1 consistent after changing S1[:, ii]
+                            # delta_s = -eps
+                            S1H1 += (-eps).unsqueeze(1) * H1[ii, :].unsqueeze(0)
+
+                        # write block back
+                        Qp[:, i1:i2] = W1
+                        s[:, i1:i2] = S1
+
+                    if not any_change:
+                        # fixed point
+                        break
+
+
+        end_evt.record()
+        torch.cuda.synchronize()
+        rounding_ms = start_evt.elapsed_time(end_evt)  # milliseconds
+
+        peak_mem_bytes = torch.cuda.max_memory_allocated()
+        peak_mem_gb = peak_mem_bytes / (1024**3)
+
+        # Store metrics as instance attributes for logging
+        self.rounding_ms = rounding_ms
+        self.peak_mem_gb = peak_mem_gb
+
         # Undo permutation
         Q = Qp[:, inv_p]
-
-
-        # # ===============================
-        # # Lazy blockwise beam rounding (per-row top-k), no global corr/q_states
-        # # ===============================
-        # rows, cols = W_ref.shape
-        # device = W_ref.device
-
-        # beam_width = int(getattr(args, "beam_size", 1))
-        # beam_width = max(1, beam_width)
-
-        # # Optional: restrict candidates around the nearest grid point
-        # # 0 or >=A => use full alphabet
-        # beam_cands = int(getattr(args, "beam_cands", 0))
-        # beam_cands = max(0, beam_cands)
-
-        # maxq = int(self.quantizer.maxq.item())
-        # A = maxq + 1
-        # codes = torch.arange(A, device=device)  # [A]
-
-        # # Output in permuted space (same as W_ref)
-        # Qp = torch.zeros_like(W_ref)
-
-        # # Track proxy objective (sum over rows) for your logging
-        # obj_rows = torch.zeros(rows, device=device)
-
-        # g_idx = []
-        # scale = []
-        # zero = []
-        # seen_groups = set() 
-        # curr_gid = None 
-
-        # for i2 in range(cols, 0, -blocksize):
-        #     i1 = max(i2 - blocksize, 0)
-        #     count = i2 - i1
-
-        #     # Current block data
-        #     W1 = W_ref[:, i1:i2]                 # [rows, count]
-        #     Lblk = L[i1:i2, i1:i2]               # [count, count]  (strictly lower, diag=0)
-
-        #     # Precompute W1 @ Lblk once (so W1@v is just a column slice)
-        #     W1_Lblk = W1 @ Lblk                    # [rows, count]
-
-        #     # Tail correction from already-fixed suffix
-        #     if i2 < cols:
-        #         E2 = (W_ref[:, i2:] - Qp[:, i2:])          # [rows, cols-i2]
-        #         Ltail = L[i2:, i1:i2]                               # [cols-i2, count]
-        #         tail_corr = E2 @ Ltail                                # [rows, count]
-        #     else:
-        #         tail_corr = torch.zeros((rows, count), device=device)
-
-        #     # Beam state ONLY for this block: [rows, Bcur, count]
-        #     # Start from current Q in this block (usually zeros at first encounter)
-        #     beam_states = Qp[:, i1:i2].float().unsqueeze(1)           # [rows, 1, count]
-        #     beam_scores = torch.zeros((rows, 1), device=device)
-
-        #     for ii in range(count - 1, -1, -1):
-        #         if groupsize != -1:
-        #             gstart = (i1 + ii) // groupsize * groupsize
-        #             gend   = min(gstart + groupsize, self.columns)
-        #             group_id = (i1 + ii) // groupsize
-
-        #             if group_id not in seen_groups:
-        #                 self.quantizer.find_params(W_ref[:, gstart:gend], weight=True)
-        #                 scale.append(self.quantizer.scale)
-        #                 zero.append(self.quantizer.zero)
-        #                 seen_groups.add(group_id)
-                
-        #         Ljj2 = (L_diag[i1 + ii] ** 2)        # scalar
-
-        #         # v = Lblk[:, ii] contains L[k, col_abs] for k in this block
-        #         v = Lblk[:, ii]                                       # [count]
-
-        #         # What = W1[:,ii] + (W1 - Qblock) @ v + tail_corr
-        #         W1v = W1_Lblk[:, ii]                                  # [rows]
-        #         Qv  = torch.matmul(beam_states, v)                    # [rows, Bcur]
-        #         What = W1[:, ii].unsqueeze(1) + (W1v.unsqueeze(1) - Qv) + tail_corr[:, ii].unsqueeze(1)  # [rows, Bcur]
-               
-        #         if beam_width <= 1:
-        #             q_greedy = self.quantizer.quantize(What.squeeze(1).unsqueeze(1)).flatten()
-        #             beam_states[:, 0, ii] = q_greedy
-        #             beam_scores[:, 0] += (What[:, 0] - q_greedy).pow(2) * Ljj2
-        #             continue
-
-        #         # Full alphabet candidates (exact over grid)
-        #         sc = self.quantizer.scale.float()
-        #         ze = self.quantizer.zero.float()
-        #         levels = (codes.view(1, -1) - ze.reshape(rows, 1)) * sc.reshape(rows, 1)              # [rows, A]
-        #         u = What / sc + ze
-                
-        #         # full alphabet code grid
-        #         du = u.unsqueeze(-1) - codes.view(1,1,A)                       # [rows,Bcur,A]
-        #         inc = (du * sc.unsqueeze(1)).pow(2) * Ljj2
-
-        #         new_scores = beam_scores.unsqueeze(-1) + inc                               # [rows,Bcur,A]
-        #         flat = new_scores.reshape(rows, -1)                                        # [rows,Bcur*A]
-
-        #         keep = min(beam_width, flat.shape[1])
-        #         topv, topi = torch.topk(flat, k=keep, dim=1, largest=False, sorted=True)  # [rows,keep]
-
-        #         parent = topi // A
-        #         choice = topi % A
-
-        #         gather_idx = parent.unsqueeze(-1).expand(-1, -1, count)
-        #         beam_states = beam_states.gather(1, gather_idx).clone()
-        #         beam_scores = topv
-                
-        #         q_sel = levels.gather(1, choice)                                           # [rows,keep]
-        #         beam_states[:, :, ii] = q_sel
-
-        #     # Commit the best beam PER ROW for this block
-        #     best = beam_scores.argmin(dim=1)                                                   # [rows]
-        #     Qp[:, i1:i2] = beam_states[torch.arange(rows, device=device), best, :].to(W_ref.dtype)
-        #     obj_rows += beam_scores.min(dim=1).values
-
-        # # Final proxy objective (sum over rows)
-        # obj_total = float(obj_rows.sum().item())
-
-        # # Undo column permutation back to original order
-        # Q = Qp[:, inv_p]
 
         if args.incoh_process:
             Q = incoherence_process(Q, SU, SV, scaleWH, args)
@@ -499,7 +482,7 @@ class GreedyAQ:
             self.layer.weight.data.dtype
         )
 
-        self.print_loss(name=name, q_weight=Q, alpha=obj_total, timecost=(time.time() - tick))
+        self.print_loss(name=name, q_weight=Q, alpha=peak_mem_gb, timecost=rounding_ms)
         
         if scale == []:
             scale.append(self.quantizer.scale)
@@ -606,4 +589,3 @@ def incoherence_process(hatWr, SU, SV, scaleWH, args):
 
     assert torch.isfinite(hatWr).all()
     return hatWr
-

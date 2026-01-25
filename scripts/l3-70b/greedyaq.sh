@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J greedyaq        # Job name
-#SBATCH -p gh             # Partition (queue) name
+#SBATCH -p gh-dev             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 5:00:00     
+#SBATCH -t 1:10:00     
 #SBATCH --output=slurm_out/greedyaq_%j.out
 #SBATCH --error=slurm_out/greedyaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -52,7 +52,7 @@ BETA=0.0003
 ALPHA_METHOD="sample"
 MIXUP=5.0
 WBITS_VALUES=(3)
-SEEDS=(0 1 2)
+SEEDS=(0)
 
 DATE=$(date +"%Y%m%d")
 mkdir -p logs/l3-70b
@@ -78,7 +78,6 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --alpha ${ALPHA} \
       --mixup-param ${MIXUP} \
       --eval \
-      --lm-eval \
       --beam-size 1 \
       --wandb \
       --wandb-project L3-70B-symm-new \

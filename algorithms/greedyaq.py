@@ -71,7 +71,7 @@ class GreedyAQ:
         self.columns = W.shape[1]
         self.H = torch.zeros((self.columns, self.columns), device=self.dev)
         self.dXXT = torch.zeros((self.columns, self.columns), device=self.dev)
-        # self.dXdXT = torch.zeros((self.columns, self.columns), device=self.dev)
+
         self.inp1 = None
         self.out1 = None
         self.nsamples = 0
@@ -84,6 +84,8 @@ class GreedyAQ:
         # sampling 
         self.sampled_alpha = sampled_alpha
         self.mixup_param = mixup_param
+        if self.sampled_alpha:
+            self.beta_dist = self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
         self.seed = seed
         torch.manual_seed(self.seed)
 
@@ -94,7 +96,6 @@ class GreedyAQ:
         else:
             self.inp1 = None
             self.out1 = None
-
 
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
@@ -112,133 +113,21 @@ class GreedyAQ:
         self.H += inp.matmul(inp.t())
         dX = self.fp_inp[0].float() * math.sqrt(2 / self.nsamples) - inp
         
-        # I'll sample alpha here - from Beta distribution (to use different sampled alpha for different calibration sample)
+        # sample alpha
         if self.sampled_alpha:
-            self._beta_dist = torch.distributions.Beta(self.mixup_param, self.mixup_param)
-            alpha = self._beta_dist.sample().item()
+            alpha = self.beta_dist.sample().item()
             alpha = min(alpha, 1-alpha)
             dX = dX * alpha
         self.dXXT += dX.matmul(inp.t())
-        # self.dXdXT += dX.matmul(dX.t())
         
         # Store |deltaX| for plotting only if enabled: shape is [channels, samples]
         if self.store_delta_x:
             abs_dX = torch.abs(dX)  # |deltaX| per channel
             self.delta_x_values.append(abs_dX.cpu().clone())
         
+        dX = None 
+        inp = None 
         del self.fp_inp[0]
-
-
-    @torch.no_grad()
-    def _structured_nn_candidates(
-        self,
-        What_batch: torch.Tensor,   # [B, rows]
-        beam_cands: int,
-        m_mult: int = 2,            # m = m_mult * beam_cands ambiguous rows per beam
-    ):
-        """
-        Structured nearest-neighbor enumeration (sphere-decoding friendly):
-
-          q0 = Quantize(What)
-          Choose m ambiguous rows with smallest flip penalty
-          Consider single-row flips to q0 +/- scale
-          Keep the best (beam_cands-1) flips + baseline
-
-        Returns:
-          cands: [B, beam_cands, rows]   (float)
-          sse:   [B, beam_cands]         where sse[b,k] = ||What - cands||^2
-        """
-        assert What_batch.dim() == 2
-        B, R = What_batch.shape
-        device = What_batch.device
-        dtype = What_batch.dtype
-
-        # Baseline quantization: quantize expects [rows, ncols] in many GPTQ quantizers
-        q0 = self.quantizer.quantize(What_batch.t().contiguous()).t().contiguous()
-        q0 = q0.to(dtype)
-
-        # If no branching requested
-        if beam_cands <= 1:
-            base_sse = (What_batch - q0).square().sum(dim=1, keepdim=True)  # [B,1]
-            return q0.unsqueeze(1), base_sse
-
-        # Per-row step
-        if not hasattr(self.quantizer, "scale") or self.quantizer.scale is None:
-            base_sse = (What_batch - q0).square().sum(dim=1, keepdim=True)
-            return q0.unsqueeze(1), base_sse
-
-        s = self.quantizer.scale.reshape(-1).to(device=device, dtype=dtype)  # [R]
-        s_row = s.view(1, R)  # [1,R]
-
-        # Determine clamp range (symmetric)
-        q_plus = self.quantizer.quantize((q0 + s_row).t().contiguous()).t().contiguous().to(dtype)
-        q_minus = self.quantizer.quantize((q0 - s_row).t().contiguous()).t().contiguous().to(dtype)
-
-        # Base SSE
-        diff0 = What_batch - q0
-        base_err = diff0.square()                 # [B,R]
-        base_sse = base_err.sum(dim=1)            # [B]
-
-        # Flip penalties per entry (how much SSE increases if you flip that single row)
-        inf = torch.tensor(float("inf"), device=device, dtype=dtype)
-
-        # change in squared error 
-        dp = (What_batch - q_plus).square()  - base_err   # [B,R]
-        dm = (What_batch - q_minus).square() - base_err   # [B,R]
-
-        # Disallow "no-op" moves (saturated)
-        dp = torch.where(q_plus != q0, dp, inf)
-        dm = torch.where(q_minus != q0, dm, inf)
-
-        # Ambiguity score = min(dp, dm)
-        dmin = torch.minimum(dp, dm)  # [B,R]
-
-        # Select m ambiguous rows per beam
-        m = min(R, m_mult * beam_cands)
-        _, amb_idx = torch.topk(dmin, k=m, largest=False)  # [B,m]
-
-        dp_sel = dp.gather(1, amb_idx)  # [B,m]
-        dm_sel = dm.gather(1, amb_idx)  # [B,m]
-
-        # Now choose best (beam_cands-1) moves among the 2*m possibilities
-        move_cost = torch.cat([dp_sel, dm_sel], dim=1)  # [B,2m]
-        nn = min(beam_cands - 1, move_cost.shape[1])
-
-        vals, move = torch.topk(move_cost, k=nn, largest=False)  # [B,nn]
-        valid = torch.isfinite(vals)                             # [B,nn]
-
-        # Decode (row, direction)
-        is_minus = move >= m
-        local = move - is_minus.to(move.dtype) * m               # [B,nn]
-        row = amb_idx.gather(1, local)                           # [B,nn]
-
-        plus_val = q_plus.gather(1, row)                         # [B,nn]
-        minus_val = q_minus.gather(1, row)                       # [B,nn]
-        chosen_val = torch.where(is_minus, minus_val, plus_val)  # [B,nn]
-
-        # Build candidates: baseline + nn moves + (optional padding)
-        K = beam_cands
-        cands = q0.unsqueeze(1).repeat(1, K, 1)                  # [B,K,R]
-
-        sse = torch.empty((B, K), device=device, dtype=dtype)
-        sse[:, 0] = base_sse
-        sse[:, 1:1+nn] = base_sse.unsqueeze(1) + vals
-        if 1 + nn < K:
-            sse[:, 1+nn:] = base_sse.unsqueeze(1)  # pad with baseline SSE
-
-        # Apply single-row edits into candidates 1..nn
-        if nn > 0:
-            b = torch.arange(B, device=device).unsqueeze(1).expand(B, nn)      # [B,nn]
-            cid = torch.arange(1, 1 + nn, device=device).unsqueeze(0).expand(B, nn)
-
-            mask = valid
-            if mask.any():
-                cands[b[mask], cid[mask], row[mask]] = chosen_val[mask]
-            # invalid moves stay baseline automatically
-            
-        return cands, sse
-
-
 
     def print_loss(self, name, q_weight, alpha, timecost):
         table = Texttable()
@@ -277,6 +166,7 @@ class GreedyAQ:
         tick = time.time()
 
         H = self.H
+        self.H = None 
 
         G = None
         if gradient is not None:
@@ -294,7 +184,7 @@ class GreedyAQ:
             G[:, dead] = 0
             
         D = self.dXXT.clone()
-        del self.dXXT 
+        self.dXXT = None
 
         if args.incoh_process:
             Hr, Dr, Wr, SU, SV, scaleWH = incoherence_preprocess(W, H, D, args)
@@ -305,6 +195,9 @@ class GreedyAQ:
             SU = None
             SV = None
             scaleWH = None
+
+        del H, D, W 
+        
 
         damp = args.percdamp * torch.mean(torch.diag(Hr))
         diag = torch.arange(Hr.shape[0], device=Hr.device)
@@ -319,10 +212,12 @@ class GreedyAQ:
         inv_p = torch.argsort(p)
         Hp = Hr[p][:, p]
         Mp = Mr[p][:, p]
-        
+        del Hr, Mr 
+
         L = torch.linalg.cholesky(Hp)
         Hp_inv = torch.cholesky_inverse(L)
-        
+        # del Hp 
+
         Delta_W = None
         if G is not None and beta != 0.0:
             Gp = G[:, p]
@@ -332,7 +227,6 @@ class GreedyAQ:
         # L = L / L_diag.unsqueeze(0)  # Broadcast division: each column divided by its diagonal
         # L = L - torch.eye(L.shape[0], device=L.device)
         
-        # I want to check diagonal dominance 
         # plot the diagonal value v.s. sum of off-diagonal values for each row of L 
         # plot_diagonal(L.t(), layer_name=name)
 
@@ -342,7 +236,7 @@ class GreedyAQ:
 
         C = Mp @ Hp_inv
         W_ref = Wr[:, p] @ C 
-        del C, Mr
+        del C, Mp
 
         if not self.quantizer.ready():
             self.quantizer.find_params(W_ref, weight=True)
@@ -350,23 +244,31 @@ class GreedyAQ:
         if Delta_W is not None:
             W_ref = W_ref - Delta_W
             del Delta_W
-
+        
         Q = torch.zeros_like(W_ref)
 
         g_idx = []
         scale = []
         zero = []
         seen_groups = set()  # Track which groups we've already saved
-        gen = torch.Generator(device=W_ref.device)
+
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt   = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
 
         for i2 in range(self.columns, 0, -blocksize):
             i1 = max(i2 - blocksize, 0)
             count = i2 - i1
+            
             W1 = W_ref[:, i1:i2].clone()
-            W2diff = W_ref[:, i2:] - Q[:, i2:]
             What1 = Q[:, i1:i2].clone()
+            Wdiff = W_ref[:, i2:] - Q[:, i2:]
             L1 = L[:, i1:i2]
-            tail_corr = W2diff @ L1[i2:, :]  
+            tail_corr = Wdiff @ L1[i2:, :]      
 
             for i in reversed(range(count)):
                 if groupsize != -1:
@@ -383,7 +285,7 @@ class GreedyAQ:
                 What = W1[:,i] + (W1 - What1) @ L1[i1:i2,i] + tail_corr[:, i]
                 What1[:, i] = self.quantizer.quantize(What.unsqueeze(1)).flatten()
             Q[:, i1:i2] = What1
-
+        
        # =======================
         # Post-LDLQ Coordinate Descent (optional)
         # =======================
@@ -479,6 +381,17 @@ class GreedyAQ:
                         # fixed point
                         break
 
+        end_evt.record()
+        torch.cuda.synchronize()
+        rounding_ms = start_evt.elapsed_time(end_evt)  # milliseconds
+
+        peak_mem_bytes = torch.cuda.max_memory_allocated()
+        peak_mem_gb = peak_mem_bytes / (1024**3)
+
+        # Store metrics as instance attributes for logging
+        self.rounding_ms = rounding_ms
+        self.peak_mem_gb = peak_mem_gb
+
         Q = Q[:, inv_p].to(Q.device)
 
         if args.alpha_method == "optimize":
@@ -487,12 +400,9 @@ class GreedyAQ:
                 alpha = args.alpha
             else:
                 WD = Wr @ Dr
-                if "70" in args.model:
-                    num = self.frob_inner_chunked(Q, WD) - self.frob_inner_chunked(Wr, WD)
-                else:
-                    diff = Q - Wr
-                    num = torch.trace(diff.t() @ WD).float()
-                    del diff
+                diff = Q - Wr
+                num = torch.trace(diff.t() @ WD).float()
+                del diff
                 del Wr, Dr
                 WDP = WD[:, p]
                 del WD
@@ -533,15 +443,6 @@ class GreedyAQ:
         zero = torch.cat(zero[::-1], dim=1)
 
         return scale, zero, g_idx, None
-
-    def frob_inner_chunked(self, A, B, col_bs=2048):
-        # returns sum_{i,j} A_ij * B_ij in float32 without big intermediates
-        assert A.shape == B.shape
-        out = torch.zeros((), device=A.device, dtype=torch.float32)
-        for c0 in range(0, A.shape[1], col_bs):
-            c1 = min(c0 + col_bs, A.shape[1])
-            out += (A[:, c0:c1] * B[:, c0:c1]).sum(dtype=torch.float32)
-        return out
 
     def free(self):
         self.inp1 = None

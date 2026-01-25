@@ -169,6 +169,14 @@ class GPTQ:
         zero = []
         now_idx = 1
 
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+
+        torch.cuda.synchronize()
+        start_evt = torch.cuda.Event(enable_timing=True)
+        end_evt   = torch.cuda.Event(enable_timing=True)
+        start_evt.record()
+
 
         for i1 in range(0, self.columns, blocksize):
             i2 = min(i1 + blocksize, self.columns)
@@ -209,6 +217,17 @@ class GPTQ:
             Losses[:, i1:i2] = Losses1 / 2
 
             W[:, i2:] -= Err1.matmul(Hinv[i1:i2, i2:])
+
+        end_evt.record()
+        torch.cuda.synchronize()
+        rounding_ms = start_evt.elapsed_time(end_evt)  # milliseconds
+
+        peak_mem_bytes = torch.cuda.max_memory_allocated()
+        peak_mem_gb = peak_mem_bytes / (1024**3)
+
+        # Store metrics as instance attributes for logging
+        self.rounding_ms = rounding_ms
+        self.peak_mem_gb = peak_mem_gb
 
         torch.cuda.synchronize()
         error = torch.sum(Losses).item()

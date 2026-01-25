@@ -45,8 +45,8 @@ MODEL_PATH="meta-llama/Llama-2-7b-hf"
 ALPHA=0.25
 BETA=0.0003
 
-WBITS_VALUES=(4)
-SEEDS=(3 4)
+WBITS_VALUES=(2)
+SEEDS=(0 1 2)
 
 DATE=$(date +"%Y%m%d")
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
@@ -71,9 +71,8 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --groupsize 128 \
       --seed $seed \
       --eval \
-      --lm-eval \
       --wandb \
-      --wandb-project L2-7B-symm-new \
+      --wandb-project Beam-Search-Bug-Fix-Vista \
       --wandb-name gptq_perchannel_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"

@@ -56,3 +56,5 @@ plots/
 logs/
 logs6/
 cache_for_guidedq/
+*.pdf 
+*.png

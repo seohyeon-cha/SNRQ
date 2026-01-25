@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -J beam7        # Job name
+#SBATCH -J beam4-8b       # Job name
 #SBATCH -p gh            # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
@@ -51,9 +51,9 @@ N_LAYERS_TO_UPDATE=32
 ALPHA_METHOD="sample"
 MIXUP=5.0
 
-WBITS_VALUES=(3)
-SEEDS=(5 6 7 8 9)
-BEAM=1 
+WBITS_VALUES=(2)
+SEEDS=(0 1 2 3 4)
+BEAM=4
 
 DATE=$(date +"%Y%m% d")
 mkdir -p logs/l3-8b
@@ -78,13 +78,13 @@ for wbits in "${WBITS_VALUES[@]}"; do
       --alpha ${ALPHA} \
       --nsamples 128 \
       --eval \
-      --lm-eval \
       --beam-size ${BEAM} \
-      --beam-cands 8 \
       --alpha-method sample \
       --mixup-param ${MIXUP} \
+      --incoh-process \
+      --incoh-mode had \
       --wandb \
-      --wandb-project Beam-Search-Block-1226 \
+      --wandb-project Beam-Search-Block-Bug-Fix-Vista \
       --wandb-name greedyaq_beam${BEAM}_${wbits}bit_seed${seed}"
     
     echo "Executing command: $CMD"

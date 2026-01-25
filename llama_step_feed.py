@@ -160,17 +160,37 @@ def llama_sequential(
     for i in range(n_layers):
         # If pass2 and layer not selected: just forward to update activations
         if mode == "requantize" and i not in requantize_layers:
+            # 1) advance teacher fp_inps so later selected layers get correct teacher reps
+            if args.method in ["gptaq", "greedyaq"]:
+                layer_t = layers_t[i].to(dev)
+                for j in range(args.nsamples):
+                    fp_inps[j] = layer_t(
+                        fp_inps[j].unsqueeze(0),
+                        attention_mask=attention_mask,
+                        position_embeddings=position_embeddings,
+                        position_ids=position_ids,
+                    )[0]
+                layers_t[i] = layer_t.cpu()
+                del layer_t
+
+                # also good hygiene: ensure cache from previous layer isn't reused
+                fp_inputs_cache.clear_cache()
+
+            # 2) advance student inps as you already do
             layer = layers_s[i].to(dev)
             for j in range(args.nsamples):
-                outs[j] = layer(inps[j].unsqueeze(0),
-                                attention_mask=attention_mask,
-                                position_embeddings=position_embeddings,
-                                position_ids=position_ids)[0]
+                outs[j] = layer(
+                    inps[j].unsqueeze(0),
+                    attention_mask=attention_mask,
+                    position_embeddings=position_embeddings,
+                    position_ids=position_ids,
+                )[0]
             layers_s[i] = layer.cpu()
             del layer
             torch.cuda.empty_cache()
             inps, outs = outs, inps
             continue
+
 
         print(f'Quantizing layer {i+1}/{n_layers}..')
         print('+------------------+--------------+------------+-----------+-------+')

@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J gptaq        # Job name
-#SBATCH -p gh             # Partition (queue) name
+#SBATCH -p gh-dev             # Partition (queue) name
 #SBATCH -N 1              # Total number of nodes
 #SBATCH -n 1              # Total number of MPI tasks
-#SBATCH -t 4:30:00     
+#SBATCH -t 1:30:00     
 #SBATCH --output=slurm_out/gptaq_%j.out
 #SBATCH --error=slurm_out/gptaq_%j.err
 #SBATCH --mail-type=BEGIN,END,FAIL
@@ -45,8 +45,8 @@ MODEL_PATH="meta-llama/Llama-2-70b-hf"
 ALPHA=0.25
 BETA=0.0003
 
-WBITS_VALUES=(3)
-SEEDS=(2 3 4)
+WBITS_VALUES=(4)
+SEEDS=(0)
 
 DATE=$(date +"%Y%m%d")
 cd /work/10322/scha0901/vista/FOEM/LLM/weight-only
