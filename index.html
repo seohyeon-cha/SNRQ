@@ -122,46 +122,34 @@
   </div>
 
   <p>
-    Deploying modern LLMs at low bit-widths hinges on post-training quantization (PTQ): compress a
-    pretrained model to an integer grid without retraining, while preserving accuracy. Layer-wise PTQ
-    methods typically do this by solving a small calibration problem per layer — but the standard
-    recipe forces a hard choice between two imperfect objectives. A <em>reconstruction</em> objective,
-    which matches the layer's output on already-quantized inputs, is numerically stable but pretends
-    the upstream quantized activations are the ground truth. A <em>mismatch</em> objective, which
-    matches the full-precision output on full-precision inputs, accounts for upstream error but is
-    noisy at the sample sizes used for calibration. Both are reasonable proxies, yet neither directly
-    targets the quantity we actually care about: how the quantized layer will behave under real,
-    unseen activations at deployment.
+    Post-training quantization (PTQ) compresses a pretrained LLM to low-bit weights without retraining,
+    and is typically cast as a layer-wise calibration problem. Existing methods force a choice between
+    two imperfect calibration objectives: a <strong>reconstruction</strong> loss that matches the layer's
+    output on already-quantized inputs — stable but blind to upstream error — and a <strong>mismatch</strong>
+    loss that matches the full-precision target on full-precision inputs — error-aware but noisy at
+    calibration scale. Neither directly targets the quantity that actually matters: <strong>how the
+    quantized layer behaves on real, unseen activations at deployment.</strong>
   </p>
   <p>
-    <strong>CoreQ</strong> starts from that deployment-time quantity and asks a simple question:
-    of the activation mismatch a quantized layer produces, how much can the layer actually <em>correct</em>
-    by choosing its weights, and how much is fundamentally unreachable? Splitting the error along these
-    lines yields a correction term that can be folded back into the weight matrix, effectively
-    <em>shifting the rounding target</em> from the original weights to a nearby mismatch-corrected
-    matrix. The remaining residual — the part no weight choice can fix — is explicitly shrunk by a
-    single interpolation coefficient whose optimal value is available in closed form, with no tuning
-    or validation sweep. Crucially, the shifted objective is still a quadratic of the same form as
-    standard PTQ, so existing solver machinery carries over unchanged; the mismatch correction enters
-    only as a change of target.
+    <strong>CoreQ</strong> starts from that deployment-time mismatch and decomposes it into a
+    <strong>reachable</strong> component that the quantized layer <em>can</em> correct by choosing its
+    weights, and an <strong>orthogonal residual</strong> it cannot. The reachable part is folded into
+    the weight matrix — effectively <strong>shifting the rounding target</strong> from the original
+    weights to a nearby mismatch-corrected matrix — while the residual is shrunk by a single
+    interpolation coefficient with a <strong>closed-form optimum</strong> (no tuning, no validation
+    sweep). The shifted objective remains a standard quadratic, so existing PTQ solver machinery
+    applies unchanged; and to actually solve it, CoreQ performs <strong>column-wise successive
+    rounding</strong>, with a bounded <strong>beam-search extension (K-CoreQ)</strong> that trades
+    compute for rounding quality.
   </p>
   <p>
-    With the objective in hand, CoreQ solves it via a row-wise successive (autoregressive) rounding
-    procedure that decodes weights column by column against the shifted target. A bounded beam-search
-    extension, <strong>K-CoreQ</strong>, keeps the best <em>K</em> partial rounding paths at each step
-    and exposes an explicit quality–compute knob: larger <em>K</em> gives better rounding decisions at
-    proportionally more runtime, while <em>K</em> = 1 recovers the greedy algorithm.
-  </p>
-  <p>
-    Empirically, CoreQ consistently outperforms strong learning-free PTQ baselines (GPTQ, GPTAQ, LDLQ)
-    across LLaMA-2 (7B / 13B / 70B) and LLaMA-3 (8B), at both 3-bit and 2-bit precision, under
-    per-channel and per-group quantization. The gains are largest where the quantization grid is
-    coarsest: on LLaMA-3-8B at 3-bit per-channel, CoreQ reduces Wiki2 perplexity by roughly 33% over
-    the next-best baseline, and on LLaMA-2-70B at 2-bit per-channel it nearly halves perplexity
-    relative to GPTQ — all while matching or approaching the wall-clock runtime of the fastest
-    baselines. The beam-search variants add further gains on top at a modest, controllable overhead,
-    and CoreQ plugs in as a drop-in replacement for the weight-only stage of rotation-based
-    weight–activation–KV quantization pipelines.
+    Across LLaMA-2 (7B / 13B / 70B) and LLaMA-3 (8B) at 2–4 bits, under both per-channel and per-group
+    quantization, CoreQ consistently outperforms strong learning-free baselines (GPTQ, GPTAQ, LDLQ).
+    <strong>Gains are largest where the grid is coarsest</strong>: CoreQ <strong>reduces Wiki2
+    perplexity by ~33% on LLaMA-3-8B at 3-bit per-channel</strong> and <strong>nearly halves 2-bit
+    per-channel perplexity on LLaMA-2-70B</strong> relative to GPTQ, at runtimes comparable to the
+    fastest baselines. Beam search adds further gains on top, and CoreQ drops in cleanly as the
+    weight-only stage of rotation-based weight–activation–KV pipelines.
   </p>
 
 </section>
