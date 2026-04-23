@@ -1,0 +1,303 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoreQ — Round Toward the Right Target: Mismatch-Aware Quantization with Successive Rounding</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Google+Sans:wght@400;500;700&family=Noto+Sans:wght@400;500;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+<script>
+  window.MathJax = {
+    tex: { inlineMath: [['\\(', '\\)'], ['$', '$']], displayMath: [['\\[', '\\]'], ['$$', '$$']] },
+    svg: { fontCache: 'global' }
+  };
+</script>
+<script async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+<style>
+  :root {
+    --fg: #1a1a1a;
+    --muted: #6b7280;
+    --accent: #1f5aa8;
+    --accent-dark: #133a6c;
+    --bg: #ffffff;
+    --bg-soft: #f6f7f9;
+    --border: #e5e7eb;
+    --highlight: #fff7cc;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: var(--fg);
+    font-family: "Google Sans", "Noto Sans", system-ui, -apple-system, sans-serif;
+    line-height: 1.6; -webkit-font-smoothing: antialiased; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .container { max-width: 960px; margin: 0 auto; padding: 0 24px; }
+
+  header.hero { padding: 56px 24px 32px; text-align: center; border-bottom: 1px solid var(--border); }
+  header.hero h1 { font-size: 2rem; margin: 0 0 8px; line-height: 1.25; font-weight: 700; }
+  header.hero .subtitle { color: var(--muted); font-size: 1rem; margin-bottom: 16px; }
+  .authors { margin: 12px 0 4px; font-size: 1rem; }
+  .affil { color: var(--muted); font-size: 0.92rem; margin-bottom: 20px; }
+
+  .link-row { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; margin-top: 18px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 9px 16px; border-radius: 999px;
+    background: #1a1a1a; color: #fff; font-weight: 500; font-size: 0.92rem;
+    border: 1px solid #1a1a1a; transition: background .15s, transform .1s;
+  }
+  .btn:hover { background: #333; text-decoration: none; transform: translateY(-1px); }
+  .btn.alt { background: #fff; color: #1a1a1a; }
+  .btn.alt:hover { background: #f3f4f6; }
+  .btn svg { width: 16px; height: 16px; }
+
+  section { padding: 40px 0 8px; }
+  section h2 { font-size: 1.4rem; margin: 0 0 16px; font-weight: 700; border-left: 4px solid var(--accent); padding-left: 10px; }
+  section p { font-size: 1rem; color: #222; }
+
+  .figure { margin: 16px 0 8px; text-align: center; }
+  .figure img { max-width: 100%; height: auto; border-radius: 6px; border: 1px solid var(--border); background: #fff; }
+  .caption { color: var(--muted); font-size: 0.9rem; margin-top: 8px; }
+
+  .highlights { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 16px; }
+  .card { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 8px; padding: 16px 18px; }
+  .card h3 { font-size: 1rem; margin: 0 0 6px; color: var(--accent-dark); }
+  .card p { margin: 0; font-size: 0.93rem; color: #333; }
+
+  .table-wrap { overflow-x: auto; margin: 14px 0 6px; border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.9rem; font-family: "Noto Sans", system-ui, sans-serif; }
+  th, td { padding: 8px 12px; text-align: center; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  th { background: #f1f3f7; font-weight: 600; }
+  td.left, th.left { text-align: left; }
+  tr.ours td { background: #eef4fc; }
+  tr.ours td.method { font-weight: 700; color: var(--accent-dark); }
+  tr.fp td { background: #fafafa; font-style: italic; color: #555; }
+  .best { font-weight: 700; }
+  .model-row td { background: #1f5aa8; color: #fff; font-weight: 600; text-align: left; padding: 6px 12px; }
+
+  footer { margin-top: 40px; padding: 24px 0 40px; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.88rem; text-align: center; }
+  code { font-family: "JetBrains Mono", monospace; font-size: 0.88em; background: #f1f3f7; padding: 1px 6px; border-radius: 4px; }
+  pre { background: #0f172a; color: #e2e8f0; padding: 14px 16px; border-radius: 8px; overflow-x: auto; font-size: 0.85rem; }
+
+  @media (max-width: 640px) {
+    header.hero h1 { font-size: 1.5rem; }
+    section h2 { font-size: 1.2rem; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="container">
+    <h1>Round Toward the Right Target:<br>Mismatch-Aware Quantization with Successive Rounding</h1>
+    <div class="subtitle">CoreQ — a mismatch-aware PTQ framework for low-bit LLMs</div>
+    <div class="authors">Seohyeon Cha, Huancheng Chen, Dongjun Kim, Haoran Zhang, Kevin Chan, Gustavo de Veciana, Haris Vikalo</div>
+    <div class="affil">The University of Texas at Austin</div>
+
+    <div class="link-row">
+      <a class="btn" href="https://arxiv.org/abs/2602.05902" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm-1 7V3.5L18.5 9H13z"/></svg>
+        Paper (arXiv)
+      </a>
+      <a class="btn" href="https://github.com/seohyeon-cha/SNRQ" target="_blank" rel="noopener">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 .5C5.73.5.67 5.56.67 11.83c0 5.01 3.24 9.26 7.74 10.76.57.1.78-.25.78-.55v-2.13c-3.15.68-3.81-1.33-3.81-1.33-.52-1.3-1.27-1.65-1.27-1.65-1.04-.71.08-.7.08-.7 1.15.08 1.75 1.18 1.75 1.18 1.02 1.76 2.68 1.25 3.33.96.1-.74.4-1.25.72-1.54-2.51-.29-5.15-1.25-5.15-5.58 0-1.23.44-2.24 1.16-3.03-.12-.29-.5-1.44.11-3.01 0 0 .95-.3 3.1 1.16.9-.25 1.86-.37 2.82-.38.96.01 1.92.13 2.82.38 2.15-1.46 3.1-1.16 3.1-1.16.61 1.57.23 2.72.11 3.01.72.79 1.15 1.8 1.15 3.03 0 4.34-2.64 5.29-5.16 5.57.41.35.77 1.05.77 2.11v3.13c0 .3.21.66.79.55 4.49-1.5 7.73-5.75 7.73-10.76C23.33 5.56 18.27.5 12 .5z"/></svg>
+        Code (GitHub)
+      </a>
+      <a class="btn alt" href="#results">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M3 3h2v18H3zM7 13h3v8H7zm5-6h3v14h-3zm5 3h3v11h-3z"/></svg>
+        Results
+      </a>
+    </div>
+  </div>
+</header>
+
+<main class="container">
+
+<section id="overview">
+  <h2>Overview</h2>
+
+  <div class="figure">
+    <img src="framework.png" alt="CoreQ framework: mismatch decomposition, shifted rounding target, successive rounding with beam search" loading="eager" style="display:block; margin: 0 auto; max-width: 100%;">
+    <div class="caption">CoreQ framework. The output-space mismatch between full-precision and quantized passes is decomposed into a reachable component (absorbed by shifting the rounding target) and an irreducible residual (shrunk by a closed-form coefficient). The shifted rounding problem is then solved by column-wise successive rounding with optional beam search.</div>
+  </div>
+
+  <p>
+    Deploying modern LLMs at low bit-widths hinges on post-training quantization (PTQ): compress a
+    pretrained model to an integer grid without retraining, while preserving accuracy. Layer-wise PTQ
+    methods typically do this by solving a small calibration problem per layer — but the standard
+    recipe forces a hard choice between two imperfect objectives. A <em>reconstruction</em> objective,
+    which matches the layer's output on already-quantized inputs, is numerically stable but pretends
+    the upstream quantized activations are the ground truth. A <em>mismatch</em> objective, which
+    matches the full-precision output on full-precision inputs, accounts for upstream error but is
+    noisy at the sample sizes used for calibration. Both are reasonable proxies, yet neither directly
+    targets the quantity we actually care about: how the quantized layer will behave under real,
+    unseen activations at deployment.
+  </p>
+  <p>
+    <strong>CoreQ</strong> starts from that deployment-time quantity and asks a simple question:
+    of the activation mismatch a quantized layer produces, how much can the layer actually <em>correct</em>
+    by choosing its weights, and how much is fundamentally unreachable? Splitting the error along these
+    lines yields a correction term that can be folded back into the weight matrix, effectively
+    <em>shifting the rounding target</em> from the original weights to a nearby mismatch-corrected
+    matrix. The remaining residual — the part no weight choice can fix — is explicitly shrunk by a
+    single interpolation coefficient whose optimal value is available in closed form, with no tuning
+    or validation sweep. Crucially, the shifted objective is still a quadratic of the same form as
+    standard PTQ, so existing solver machinery carries over unchanged; the mismatch correction enters
+    only as a change of target.
+  </p>
+  <p>
+    With the objective in hand, CoreQ solves it via a row-wise successive (autoregressive) rounding
+    procedure that decodes weights column by column against the shifted target. A bounded beam-search
+    extension, <strong>K-CoreQ</strong>, keeps the best <em>K</em> partial rounding paths at each step
+    and exposes an explicit quality–compute knob: larger <em>K</em> gives better rounding decisions at
+    proportionally more runtime, while <em>K</em> = 1 recovers the greedy algorithm.
+  </p>
+  <p>
+    Empirically, CoreQ consistently outperforms strong learning-free PTQ baselines (GPTQ, GPTAQ, LDLQ)
+    across LLaMA-2 (7B / 13B / 70B) and LLaMA-3 (8B), at both 3-bit and 2-bit precision, under
+    per-channel and per-group quantization. The gains are largest where the quantization grid is
+    coarsest: on LLaMA-3-8B at 3-bit per-channel, CoreQ reduces Wiki2 perplexity by roughly 33% over
+    the next-best baseline, and on LLaMA-2-70B at 2-bit per-channel it nearly halves perplexity
+    relative to GPTQ — all while matching or approaching the wall-clock runtime of the fastest
+    baselines. The beam-search variants add further gains on top at a modest, controllable overhead,
+    and CoreQ plugs in as a drop-in replacement for the weight-only stage of rotation-based
+    weight–activation–KV quantization pipelines.
+  </p>
+
+</section>
+
+<section id="results">
+  <h2>Main Results</h2>
+  <p>
+    Per-group symmetric weight quantization (group size 128) on LLaMA-2/3 models. We report Wiki2 / C4
+    perplexity (↓), average zero-shot accuracy across six tasks (WinoGrande, PIQA, HellaSwag, BoolQ, ArcE, ArcC, ↑),
+    and end-to-end quantization time. <strong>CoreQ</strong> is the greedy successive-rounding variant;
+    <strong>k-CoreQ</strong> uses a beam of width <em>k</em>. Best results (within one std of best) are bolded.
+  </p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th class="left">Model</th>
+          <th>Bits</th>
+          <th class="left">Method</th>
+          <th>Wiki2 ↓</th>
+          <th>C4 ↓</th>
+          <th>Avg. Acc ↑</th>
+          <th>Q.Time (s)</th>
+        </tr>
+      </thead>
+      <tbody>
+
+        <tr class="model-row"><td colspan="7">LLaMA-3 8B</td></tr>
+        <tr class="fp"><td class="left">L3-8B</td><td>16</td><td class="left">FP16</td><td>6.14</td><td>8.93</td><td>74.31</td><td>—</td></tr>
+        <tr><td class="left" rowspan="6">L3-8B</td><td rowspan="6">3</td><td class="left">GPTQ</td><td>9.87 ± 0.28</td><td>12.74 ± 0.40</td><td>66.82 ± 0.65</td><td>547.5</td></tr>
+        <tr><td class="left">GPTAQ</td><td>9.07 ± 0.33</td><td>12.15 ± 0.13</td><td>65.77 ± 1.28</td><td>715.0</td></tr>
+        <tr><td class="left">LDLQ</td><td>14.99 ± 2.85</td><td>14.12 ± 1.47</td><td>65.20 ± 2.31</td><td>472.5</td></tr>
+        <tr class="ours"><td class="left method">CoreQ</td><td class="best">8.42 ± 0.16</td><td>11.79 ± 0.19</td><td class="best">68.92 ± 0.58</td><td>575.2 ± 24.9</td></tr>
+        <tr class="ours"><td class="left method">4-CoreQ</td><td>8.60 ± 0.51</td><td class="best">11.57 ± 0.10</td><td>68.11 ± 1.65</td><td>784.0 ± 26.3</td></tr>
+        <tr class="ours"><td class="left method">8-CoreQ</td><td class="best">8.47 ± 0.35</td><td class="best">11.66 ± 0.25</td><td class="best">68.70 ± 1.46</td><td>855.1 ± 26.1</td></tr>
+
+        <tr class="model-row"><td colspan="7">LLaMA-2 7B</td></tr>
+        <tr class="fp"><td class="left">L2-7B</td><td>16</td><td class="left">FP16</td><td>5.47</td><td>6.97</td><td>70.47</td><td>—</td></tr>
+        <tr><td class="left" rowspan="6">L2-7B</td><td rowspan="6">3</td><td class="left">GPTQ</td><td>6.75 ± 0.06</td><td>8.26 ± 0.01</td><td>66.14 ± 0.34</td><td>467.9</td></tr>
+        <tr><td class="left">GPTAQ</td><td>6.57 ± 0.03</td><td>8.04 ± 0.01</td><td>66.34 ± 0.51</td><td>590.4</td></tr>
+        <tr><td class="left">LDLQ</td><td>6.64 ± 0.10</td><td>8.12 ± 0.05</td><td>66.50 ± 0.57</td><td>427.8</td></tr>
+        <tr class="ours"><td class="left method">CoreQ</td><td>6.39 ± 0.03</td><td>7.86 ± 0.02</td><td class="best">67.16 ± 0.34</td><td>470.7 ± 23.3</td></tr>
+        <tr class="ours"><td class="left method">4-CoreQ</td><td class="best">6.31 ± 0.02</td><td class="best">7.82 ± 0.01</td><td class="best">67.12 ± 0.24</td><td>701.2 ± 20.2</td></tr>
+        <tr class="ours"><td class="left method">8-CoreQ</td><td class="best">6.31 ± 0.02</td><td class="best">7.83 ± 0.02</td><td class="best">67.05 ± 0.36</td><td>709.4 ± 33.2</td></tr>
+
+        <tr class="model-row"><td colspan="7">LLaMA-2 13B</td></tr>
+        <tr class="fp"><td class="left">L2-13B</td><td>16</td><td class="left">FP16</td><td>4.88</td><td>6.47</td><td>73.23</td><td>—</td></tr>
+        <tr><td class="left" rowspan="6">L2-13B</td><td rowspan="6">3</td><td class="left">GPTQ</td><td>5.60 ± 0.03</td><td>7.16 ± 0.01</td><td class="best">70.93 ± 0.65</td><td>820.5</td></tr>
+        <tr><td class="left">GPTAQ</td><td>5.54 ± 0.01</td><td>7.10 ± 0.00</td><td class="best">71.00 ± 0.11</td><td>1012.0</td></tr>
+        <tr><td class="left">LDLQ</td><td>5.57 ± 0.02</td><td>7.12 ± 0.00</td><td class="best">70.97 ± 0.36</td><td>719.2</td></tr>
+        <tr class="ours"><td class="left method">CoreQ</td><td>5.53 ± 0.04</td><td>7.06 ± 0.03</td><td class="best">71.19 ± 0.56</td><td>824.3 ± 30.0</td></tr>
+        <tr class="ours"><td class="left method">4-CoreQ</td><td class="best">5.51 ± 0.03</td><td class="best">7.04 ± 0.01</td><td class="best">70.87 ± 0.27</td><td>1189.5 ± 52.1</td></tr>
+        <tr class="ours"><td class="left method">8-CoreQ</td><td class="best">5.50 ± 0.02</td><td class="best">7.04 ± 0.01</td><td class="best">71.03 ± 0.30</td><td>1242.0 ± 34.7</td></tr>
+
+      </tbody>
+    </table>
+  </div>
+  <div class="caption">
+    Reporting over three random seeds. CoreQ consistently improves 3-bit perplexity and accuracy
+    over GPTQ / GPTAQ / LDLQ; beam variants (4-/8-CoreQ) offer further gains at controllable additional compute.
+  </div>
+
+  <h2 style="margin-top:36px;">Extreme Low-Bit Quantization on LLaMA-2 70B</h2>
+  <p>
+    Symmetric 2-bit and 3-bit weight quantization on LLaMA-2 70B. The gap over baselines widens sharply
+    at 2-bit, where the quantization grid is coarsest — CoreQ nearly halves per-channel Wiki2 perplexity
+    relative to GPTQ and also leads at per-group granularity.
+  </p>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Bits</th>
+          <th class="left">Method</th>
+          <th colspan="3" style="background:#e9eef6;">Per-channel</th>
+          <th colspan="3" style="background:#e9eef6;">Per-group (g=128)</th>
+        </tr>
+        <tr>
+          <th></th>
+          <th></th>
+          <th>Wiki2 ↓</th><th>C4 ↓</th><th>Q.Time (s)</th>
+          <th>Wiki2 ↓</th><th>C4 ↓</th><th>Q.Time (s)</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr class="fp"><td>16</td><td class="left">FP16</td><td>3.32</td><td>5.52</td><td>—</td><td>3.32</td><td>5.52</td><td>—</td></tr>
+        <tr><td rowspan="4">2</td><td class="left">GPTQ</td><td>181.31 ± 19.81</td><td>83.17 ± 5.14</td><td>3301.2 ± 73.0</td><td>12.38 ± 1.42</td><td>11.08 ± 0.10</td><td>3271.6 ± 9.5</td></tr>
+        <tr><td class="left">GPTAQ</td><td>251.82 ± 80.72</td><td>83.59 ± 11.38</td><td>4663.4 ± 3.0</td><td>12.28 ± 3.07</td><td>11.85 ± 2.16</td><td>4846.5 ± 43.9</td></tr>
+        <tr><td class="left">LDLQ</td><td>193.51 ± 36.21</td><td>91.32 ± 10.08</td><td>2753.5 ± 26.7</td><td>8.68 ± 0.29</td><td>9.90 ± 0.22</td><td>2939.7 ± 76.5</td></tr>
+        <tr class="ours"><td class="left method">CoreQ</td><td class="best">94.97 ± 12.49</td><td class="best">38.46 ± 2.37</td><td>4731.9 ± 69.3</td><td class="best">7.63 ± 0.49</td><td class="best">8.95 ± 0.32</td><td>4772.1 ± 89.6</td></tr>
+
+        <tr><td rowspan="4">3</td><td class="left">GPTQ</td><td>5.11 ± 0.02</td><td>6.77 ± 0.02</td><td>3256.0 ± 0.6</td><td>4.00 ± 0.01</td><td>5.95 ± 0.01</td><td>3323.5 ± 22.6</td></tr>
+        <tr><td class="left">GPTAQ</td><td>5.09 ± 0.05</td><td>6.73 ± 0.01</td><td>4727.5 ± 37.1</td><td>4.01 ± 0.02</td><td>5.95 ± 0.01</td><td>4731.5 ± 90.9</td></tr>
+        <tr><td class="left">LDLQ</td><td>5.06 ± 0.02</td><td>6.73 ± 0.02</td><td>2855.0 ± 137.9</td><td>3.97 ± 0.01</td><td>5.94 ± 0.00</td><td>2914.3 ± 0.9</td></tr>
+        <tr class="ours"><td class="left method">CoreQ</td><td class="best">4.83 ± 0.03</td><td class="best">6.52 ± 0.01</td><td>4785.1 ± 28.3</td><td class="best">3.93 ± 0.01</td><td class="best">5.90 ± 0.00</td><td>4783.5 ± 96.8</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="caption">
+    The benefit of mismatch correction grows as the quantization constraint tightens: at 2-bit per-channel,
+    all baselines collapse above 180 ppl on Wiki2 while CoreQ stays under 100.
+  </div>
+
+  <h2 style="margin-top:36px;">Beam-Search Trade-off (LLaMA-2 7B, 3-bit)</h2>
+  <p>
+    K-CoreQ exposes an explicit quality–compute knob: as the beam width \(K\) grows, rounding quality
+    improves monotonically at a controllable runtime cost. The plot below sweeps \(K\) on LLaMA-2 7B
+    at 3-bit per-channel quantization, reporting Wiki2 perplexity versus beam width and wall-clock
+    quantization time.
+  </p>
+  <div class="figure">
+    <img src="beam_sweep_l2_7b.png" alt="Beam-width sweep for K-CoreQ on LLaMA-2 7B at 3-bit: perplexity vs. beam width K" loading="eager" style="display:block; margin: 0 auto; max-width: 100%;">
+    <div class="caption">Beam-width sweep for K-CoreQ on LLaMA-2 7B at 3-bit. Increasing \(K\) steadily reduces Wiki2 perplexity with a modest, predictable increase in quantization time.</div>
+  </div>
+</section>
+
+<section id="bibtex">
+  <h2>BibTeX</h2>
+<pre>@article{Cha2026,
+  title   = {Regularized Calibration with Successive Rounding for Post-Training Quantization},
+  author  = {Cha, Seohyeon and Chen, Huancheng and Kim, Dongjun and Zhang, Haoran and Chan, Kevin and de Veciana, Gustavo and Vikalo, Haris},
+  journal = {arXiv preprint arXiv:2602.05902},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2602.05902}
+}</pre>
+</section>
+
+</main>
+
+<footer>
+  <div class="container">
+    Page template inspired by <a href="https://nerfies.github.io/" target="_blank" rel="noopener">Nerfies</a>.
+    Content © the authors.
+  </div>
+</footer>
+
+</body>
+</html>
